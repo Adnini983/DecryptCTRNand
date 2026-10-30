@@ -1,6 +1,6 @@
 # DecryptCTRNand
 
-3DS NAND Dump 离线解密工具（PC 端，Windows 原生）。
+3DS NAND Dump 离线解密工具（PC 端，Windows 原生；另附纯 JDK 11 GUI 实现）。
 
 ## 创作说明
 
@@ -10,110 +10,168 @@
 
 当前 GodMode9（GM9）对开发机（dev）NAND 仍无法完全解密，本工具提供 PC 端离线解密替代方案。
 
+## 版本
+
+- **v0.2（当前）**：依据外部代码审计系统性加固正确性/输入验证/输出验证/安全（详见下方「v0.2 变更」），并新增 **纯 JDK 11 GUI 实现** 与 **合成测试向量三端交叉验证**。
+- v0.1：初版（BAT + PowerShell），已在用户实机 dump 上验证（见「验证状态」）。
+
 ## 主交付形态
 
-**主交付 = Windows 原生 BAT + PowerShell**（.bat 启动器 + .ps1 核心逻辑）
-- 纯 Windows 内置能力：.NET Framework 自带 Aes / SHA256 / BigInteger
-- 零外部依赖、无需 Python / pip / OpenSSL
-
-Python 版（`DecryptCTRNand.py`）保留为内部交叉验证参考，非主交付。
+- **主交付 = Windows 原生 BAT + PowerShell**（`DecryptCTRNand.bat` + `DecryptCTRNand.ps1`）：仅用 .NET Framework 内置 Aes / SHA256 / BigInteger，零外部依赖、无需 Python / pip / OpenSSL。
+- **Python 参考实现**（`DecryptCTRNand.py`）：与主交付逐字节等价的交叉验证实现（v0.2 起已具备完整分区解密能力），仅需 `pycryptodome`。
+- **Java 11 GUI**（`java/DecryptCTRNandGUI.jar` + 启动器）：纯 JDK（Swing + javax.crypto + BigInteger），**零外部依赖，只要有 JRE/JDK 11+ 即可双击使用**；同一 jar 也支持 `--cli` 无头模式。
 
 ## 运行环境要求
-
-**主交付零外部依赖（无 Python / pip / OpenSSL）。**
 
 | 组件 | 最低版本 | 说明 |
 |------|---------|------|
 | Windows PowerShell | 5.1 | Win10 1903+ / Win11 预装；Win7/8.1 需安装 [WMF 5.1](https://www.microsoft.com/download/details.aspx?id=54616) |
 | .NET Framework | 4.5+（推荐 4.8） | Win10 1903+ / Win11 预装 4.8；Win7/8.1 需手动安装 |
 | System.Numerics.BigInteger | .NET 4.0+ | 128 位大数运算（scrambler / counter） |
-| System.Security.Cryptography.Aes | .NET 3.5+（Aes.Create 工厂方法 4.0+） | AES-CBC / AES-CTR 加解密 |
-| Add-Type 内联 C# | .NET Framework 自带 csc.exe | 无需 Visual Studio，.NET Framework 4.x 自带 C# 编译器 |
+| System.Security.Cryptography.Aes | .NET 3.5+ | AES-CBC / AES-CTR 加解密 |
+| Add-Type 内联 C# | .NET Framework 自带 csc.exe | 无需 Visual Studio |
+| Java（GUI 版） | JRE/JDK 11+ | 仅 `java`/`javaw`，无其他依赖 |
 
 **推荐环境：Windows 10 1903 或更高版本（自带 PowerShell 5.1 + .NET Framework 4.8），开箱即用。**
 
 ## 功能
 
-- 从明文 boot9 + OTP + eMMC CID 派生 console-unique normalKey
-- 自动解密 OTP（dev / retail 双模式）
-- 解析 NCSD 头与分区表
-- 逐分区 AES-CTR 解密（CTRNAND / firm0 / firm1 / TWL / AGB save）
-- 完整性校验（NCSD 魔数 / MBR 55AA / FIRM magic）
+- 从明文 boot9 + OTP + eMMC CID 派生 console-unique normalKey（slot 0x04–0x07）
+- 自动解密 OTP（dev / retail 双模式，**双路径统一校验**：DEADB00F + SHA256 + dev flag 与模式一致性）
+- 解析 NCSD 头与分区表（**边界/重叠检查**，未知 crypt/fs 组合拒绝解密、不猜 AES slot）
+- 逐分区 AES-CTR 解密（CTRNAND / firm0 / firm1 / AGB save；TWL 明确标记不支持）
+- 输出结构校验：CTRNAND MBR 55AA、FIRM magic；并核对实际写入字节数、记录每分区 SHA-256
+- 输出安全：先写 `.tmp`、校验通过后原子提交；默认拒绝覆盖（需 `-Force`）；密钥/CID 默认隐藏（`-ShowKeys` 显示）
+
+### v0.2 变更（对照审计逐项）
+
+| 审计项 | v0.2 处理 |
+|------|------|
+| AES-CTR 逐块 `TransformFinalBlock` | 改为一次性生成 counter 流 + 单次 AES-ECB 批量加密（PS1/Python/Java 三端同构） |
+| 读取无完整性检查（截断仍报成功） | 新增 `ReadExactly`：短读/截断立即抛错；输出核对实际写入字节数；每分区 SHA-256 |
+| boot9 / OTP / CID 长度校验 | boot9 支持 0x10000 与 0x8000；OTP 严格 0x100；CID 严格 16B / 32 hex，密钥派生前完成 |
+| NCSD 偏移启发式（0xB00000） | 删除；改用规则表：crypt1→slot03(不支持)、crypt2+fs1→04、fs3→06、fs4→07、crypt3→05，其余拒绝 |
+| NCSD 分区表无边界/重叠检查 | 已加：offset<0x200 跳过、零大小跳过、越界抛错、两两重叠抛错 |
+| `-OtpDecrypted` 绕过校验 | 统一走 `Assert-ValidOtpPlain`（长度 + Magic + SHA256 + dev flag↔Mode 一致性），加密/解密两路径一致 |
+| Mode 与 OTP dev flag 不一致 | 校验失败即中止，不再一路跑到底 |
+| 直接打印 normalKey / CID | 默认隐藏；`-ShowKeys` 才显示；日志不落盘 |
+| README 声称的 MBR/FIRM 校验未实现 | v0.2 已真正实现（MBR 55AA @ 分区内 +0x1FE；FIRM magic @ +0x100）。**CTR 卷标断言取消**（从未实现，AES-CTR 无认证，保留结构合理性检查） |
+| 输出被静默覆盖 | 默认拒绝覆盖，`-Force` 显式授权；`.tmp` 写入 → 校验 → 原子 rename 提交；finally 清理 |
+| Python 未实现分区解密 | 已实现完整分区解密/结构校验/`--force`/`--show-keys`/每分区 SHA-256 |
+| Python retail keyinit 硬编码 dev | `keyinit(otp_plain, boot9, dev)` 由 `--mode` 传入，零售 keyblob 偏移正确 |
+| Python 缺明文 OTP 校验 | 与 PS1 相同的统一 `validate_otp` |
+| 独立测试向量 | `tests/`：合成 boot9/OTP/CID/NCSD 向量 + 三端（PS1/Python/Java）逐字节交叉验证 + 负向用例（见「测试」） |
 
 ## 启动方式
 
-### 方式一：BAT 启动器（推荐）
+### 方式一：BAT 启动器（主交付，推荐）
 
 ```cmd
-DecryptCTRNand.bat -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem> -CidFile <nand_cid.mem> -Mode dev
+DecryptCTRNand.bat -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 ```
 
 ### 方式二：PowerShell 直接调用
 
 ```powershell
-.\DecryptCTRNand.ps1 -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem> -OtpDecrypted -CidFile <nand_cid.mem> -Mode dev
+.\DecryptCTRNand.ps1 -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 ```
 
-### 方式三：Python 交叉验证（参考）
+### 方式三：Python 参考实现
 
 ```powershell
-python DecryptCTRNand.py --nand <sysnand.bin> --boot9 <boot9.bin> --otp otp_dec.mem --otp-dec --cid-file nand_cid.mem
+python DecryptCTRNand.py --nand sysnand.bin --boot9 boot9.bin --otp otp.mem --cid-file nand_cid.mem --mode dev --outdir out
 ```
 
-## 命令行参数（PS1/BAT 通用）
+### 方式四：Java 11 GUI / CLI
 
-| 参数 | 说明 |
-|------|------|
-| `-NandFile` | NAND dump 文件路径（必填） |
-| `-Boot9File` | 明文 boot9.bin 路径（必填） |
-| `-OtpFile` | OTP 文件路径（必填，加密或解密均可） |
-| `-OtpDecrypted` | OTP 已是解密明文（跳过自动解密） |
-| `-CidHex` | eMMC CID（32 字符 hex 字符串） |
-| `-CidFile` | nand_cid.mem 文件路径（16 字节） |
-| `-OutDir` | 解密分区输出目录（可选） |
-| `-Mode` | `dev`（默认）或 `retail` |
+```cmd
+DecryptCTRNandGUI.bat                    REM 双击 / 运行：打开 Swing GUI
+DecryptCTRNandGUI.bat --cli --nand sysnand.bin --boot9 boot9.bin --otp otp.mem --cid-file nand_cid.mem --mode dev --outdir out
+```
+
+GUI 里选择文件、勾选选项后点「Start Decryption」即可；后台线程解密，进度条 + 日志区实时显示，可取消。
+
+## 命令行参数
+
+三端参数一一对应：
+
+| PS1 / BAT | Python / Java CLI | 说明 |
+|------|------|------|
+| `-NandFile` | `--nand` | NAND dump 文件路径（必填） |
+| `-Boot9File` | `--boot9` | 明文 boot9.bin（必填，64KB 或 32KB 均可） |
+| `-OtpFile` | `--otp` | OTP 文件（必填，加密或解密均可） |
+| `-OtpDecrypted` | `--otp-dec` | OTP 已是解密明文（仍会统一校验） |
+| `-CidHex` | `--cid` | eMMC CID，32 个 hex 字符 |
+| `-CidFile` | `--cid-file` | nand_cid.mem（16 字节） |
+| `-OutDir` | `--outdir` | 解密分区输出目录 |
+| `-Mode` | `--mode` | `dev`（默认）或 `retail` |
+| `-Force` | `--force` | 允许覆盖已存在的输出文件（默认拒绝） |
+| `-ShowKeys` | `--show-keys` | 显示派生的 normalKey（默认隐藏） |
 
 ## 输入文件说明
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
 | sysnand.bin | ~950MB | 完整 NAND dump（GodMode9 格式） |
-| boot9.bin | 64KB | 明文 boot9（GM9 dump 格式，含前 32KB prot + 后 32KB boot9） |
+| boot9.bin | 64KB / 32KB | 明文 boot9（64KB GM9 dump：前 32KB prot + 后 32KB boot9；或 32KB prot-only） |
 | otp.mem | 256B | 加密 OTP（GM9 dump 格式） |
-| otp_dec.mem | 256B | 解密后 OTP（可选，跳过自动解密） |
+| otp_dec.mem | 256B | 解密后 OTP（可选，`-OtpDecrypted` 时使用，仍会校验） |
 | nand_cid.mem | 16B | eMMC CID（NAND 芯片出厂值） |
 
 ## 输出
 
-- 密钥派生结果（slot0x04–0x07 normalKey）
-- NCSD 分区表解析（偏移/大小/slot）
-- 解密分区文件（partition_N_slotNN.bin，需 -OutDir 指定）
+- 默认仅输出状态行；`-ShowKeys` 时才显示 slot 0x04–0x07 normalKey 与 CID（敏感，默认隐藏）
+- 解密分区文件 `partition_N_slotNN.bin`（需 `-OutDir`）：先写 `.tmp`，通过结构校验 + 字节数核对后原子提交；每分区打印 SHA-256
+- 未知 crypt/fs 类型的分区会明确跳过并提示，**不会**擅自套用某个 AES slot
+
+## 完整性/安全说明（如实口径）
+
+- **结构校验 ≠ 密码学认证**：AES-CTR 不提供完整性保护。MBR 55AA（2 字节）与 FIRM magic（4 字节）只是合理性检查；完整分区正确性以「与可信实现逐字节比对 / SHA-256 一致」为准（见「测试」）。
+- README 早期版本声称的 **CTR 卷标校验从未实现，v0.2 已明确取消该断言**。
+- 密钥与 CID 为 per-console 敏感材料：默认不显示、不落盘。
 
 ## 验证状态
 
+### 实机验证（v0.1，用户提供 dump）
+
 | 平台 | 模式 | 状态 |
 |------|------|------|
-| Old3DS devkit (REFxxxxxxx) | dev | ✅ 端到端验证通过（CTRNAND MBR 55AA / firm0 FIRM magic） |
-| New3DS retail (QJFxxxxxxx) | retail | ✅ 端到端验证通过（CTRNAND MBR 55AA / 卷标 CTR） |
+| Old3DS devkit (REFxxxxxxx) | dev | ✅ 端到端验证通过（OTP 解密、NCSD 5 分区、CTRNAND MBR 55AA、firm0 FIRM magic） |
+| New3DS retail (QJFxxxxxxx) | retail | ✅ 端到端验证通过（CTRNAND MBR 55AA） |
 
-**已知技术点：**
-- slot0x05（New3DS CTRNAND）KeyY 为固定全局值 `0x4D804F4E9990194613A204AC584460BE`（dev/retail 通用），不从 boot9 keyblob 读取
-- Old3DS CTRNAND = slot0x04，New3DS CTRNAND = slot0x05（按 NCSD crypttype 自动判定）
+### v0.2 合成向量三端交叉验证（`tests/`）
+
+- 构造含全部槽位映射的合成 NAND（CTRNAND slot04、FIRM slot06、AGB slot07、TWL 跳过、New3DS CTRNAND slot05），dev / retail 各一套；
+- **PS1、Python、Java 三端解密输出与 oracle 逐字节一致**（dev + retail 全部 4 个可解密分区），且三端互为一致；
+- `-OtpDecrypted` 路径输出一致；
+- 负向用例通过：无 `-Force` 拒绝覆盖、零售模式拒绝 dev OTP（dev flag 一致性）、截断 NAND 拒绝、非法 CID hex 拒绝。
 
 ## 已知限制
 
 - **CID 依赖**：AES-CTR nonce = SHA256(CID)[:16]，128 位不可暴力破解。CID 是 eMMC 芯片出厂值，不在 OTP 内，必须从实机 dump 获取。
-- **TWL 分区**：nonce 方案不同（SHA1(CID) 反转），当前版本未实现。
+- **TWL 分区**：nonce 方案不同（SHA1(CID) 反转），当前版本明确标记不支持并跳过，不强行解密。
 - **组件级解析**：仅完成解密与结构验证（MBR / FIRM magic），NAND FS 挂载与文件系统级分析需后续工具。
 
-## 详细验证明细（dev 本机）
-- ✅ OTP 解密：已在 REFxxxxxxx 本机 dump 端到端验证通过（dev 模式，DEADB00F + SHA256 校验双通过）
-- ✅ NCSD 解析：已在 REFxxxxxxx 本机 dump 端到端验证通过（5 分区识别正确）
-- ✅ scrambler 公式：已用 dev slot0x2C 已知 KeyX/KeyY/KeyN 反推 C1 并前向验证通过
-- ✅ keyinit 算法：已移植自 pyctr（MIT），slot0x04–0x07 normalKey 与 pyctr / Python 版逐字节匹配
-- ✅ CTRNAND 解密：已在 REFxxxxxxx 本机 dump 端到端验证通过（MBR 55AA）
-- ✅ firm0 解密：已在 REFxxxxxxx 本机 dump 端到端验证通过（FIRM magic）
-- ✅ BAT/PS1 与 Python 版输出交叉验证一致
+## 测试
+
+```powershell
+# 1) 生成合成向量（boot9/OTP/CID/NCSD，含 oracle 期望输出）
+python tests\make_testvectors.py
+
+# 2) 三端交叉验证（PS1 + Python；带上 Java jar 则三端）
+powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1
+powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1 -JavaJar java\DecryptCTRNandGUI.jar
+```
+
+退出码 0 = 全部通过。
+
+## Java 11 构建（仅当需要重新打包 jar 时）
+
+```cmd
+java\build.bat
+```
+
+产物：`java\DecryptCTRNandGUI.jar`（`javac --release 11` 编译，Java 11 字节码；Main-Class manifest）。分发时把 `java\DecryptCTRNandGUI.jar` 与根目录 `DecryptCTRNandGUI.bat` 放一起即可。
 
 ## 方案依据
 
@@ -123,5 +181,5 @@ python DecryptCTRNand.py --nand <sysnand.bin> --boot9 <boot9.bin> --otp otp_dec.
 
 ## 敏感口径
 
-- OTP / CID / movable.sed 等 per-console 敏感字段仅用于解密与验证，不展示明文
+- OTP / CID / movable.sed / normalKey 等 per-console 敏感字段仅用于解密与验证，默认不展示明文（`-ShowKeys` 显式开启才显示）
 - 输出文件名使用通用名，不含原始序列号

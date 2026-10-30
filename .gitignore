@@ -1,0 +1,9 @@
+# build intermediates
+java/classes/
+
+# test run output (vectors/ and expected/ are committed for instant cross-check)
+tests/out/
+
+# temp files
+*.tmp
+tests/vectors/nand_truncated.bin

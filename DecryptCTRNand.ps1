@@ -1,19 +1,42 @@
 <#
 .SYNOPSIS
-    DecryptCTRNand - 3DS NAND Dump Decryptor (Windows Native: PowerShell + .NET)
+    DecryptCTRNand v0.2 - 3DS NAND Dump Decryptor (Windows Native: PowerShell + .NET)
+
 .DESCRIPTION
     Decrypt 3DS NAND dumps using plaintext boot9 + OTP + eMMC CID.
     Keyinit algorithm ported from pyctr crypto/engine.py (MIT), validated on SPR devkit dump.
+
+    v0.2 changes (correctness / input validation / output validation):
+      * AES-CTR now builds the full counter stream and encrypts it with a single
+        TransformBlock call (no per-block TransformFinalBlock in a loop).
+      * ReadExactly loop: short reads are re-read until the requested length is
+        filled; a truncated NAND now aborts instead of silently reporting success.
+      * Strict input length validation (boot9 / OTP / CID / -CidHex / NAND).
+      * OTP plaintext is ALWAYS validated (DEADB00F magic + SHA256 + length +
+        dev flag vs -Mode), including the -OtpDecrypted path.
+      * NCSD partition table boundary / overlap checks; unknown crypt/fs types are
+        refused instead of defaulting to a guessed AES slot.
+      * Structural output checks: MBR 55AA (CTRNAND), FIRM magic (firm partitions),
+        actual written byte count, per-partition SHA-256 record.
+      * Overwrite protection: refuses to overwrite existing outputs unless -Force.
+      * Keys written to a .tmp file first and renamed only after checks pass.
+      * normalKeys / CID are hidden by default; use -ShowKeys to display.
+      * try/finally resource cleanup.
+
 .NOTES
     Naming motivation: GodMode9 cannot fully decrypt dev NAND on-device;
     this tool provides PC-side offline decryption as an alternative.
+
+    Structural checks (MBR 55AA / FIRM magic / SHA-256) are sanity checks only.
+    AES-CTR provides no integrity/authentication: they do not prove the output
+    is authentic, they only catch obviously wrong keys/offsets/truncation.
 #>
 
 param(
     [Parameter(Mandatory=$true, HelpMessage="NAND dump file path")]
     [string]$NandFile,
 
-    [Parameter(Mandatory=$true, HelpMessage="Plaintext boot9.bin path")]
+    [Parameter(Mandatory=$true, HelpMessage="Plaintext boot9.bin path (64KB GM9 dump or 32KB prot-only)")]
     [string]$Boot9File,
 
     [Parameter(Mandatory=$true, HelpMessage="OTP file path (encrypted or decrypted)")]
@@ -28,7 +51,13 @@ param(
     [string]$OutDir,
 
     [ValidateSet("dev","retail")]
-    [string]$Mode = "dev"
+    [string]$Mode = "dev",
+
+    # Allow overwriting existing output files
+    [switch]$Force,
+
+    # Display derived normalKeys (hidden by default for security)
+    [switch]$ShowKeys
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,12 +74,9 @@ public static class NandCrypto {
     public static readonly BigInteger Mask128 = (BigInteger.One << 128) - BigInteger.One;
 
     public static byte[] ROL128(byte[] input, int n) {
-        // input is big-endian 16 bytes
-        // Convert to little-endian BigInteger (unsigned)
         byte[] le = new byte[16];
         Array.Copy(input, 0, le, 0, 16);
-        Array.Reverse(le);  // big-endian -> little-endian (16 bytes)
-        // Add 0x00 at the end (highest position) to force unsigned
+        Array.Reverse(le);
         byte[] leUnsigned = new byte[17];
         Array.Copy(le, 0, leUnsigned, 0, 16);
         leUnsigned[16] = 0;
@@ -58,7 +84,7 @@ public static class NandCrypto {
         val = ((val << n) | (val >> (128 - n))) & Mask128;
         byte[] result = val.ToByteArray();
         Array.Resize(ref result, 16);
-        Array.Reverse(result);  // little-endian -> big-endian
+        Array.Reverse(result);
         return result;
     }
 
@@ -67,12 +93,10 @@ public static class NandCrypto {
     }
 
     public static byte[] Scramble(byte[] keyX, byte[] keyY) {
-        // NormalKey = (((KeyX ROL 2) XOR KeyY) + C1) ROR 41
+        // NormalKey = (((KeyX ROL 2) XOR KeyY) + C1) ROR 41   (== pyctr rol(..., 87))
         byte[] kxRol2 = ROL128(keyX, 2);
         byte[] xor = new byte[16];
         for (int i = 0; i < 16; i++) xor[i] = (byte)(kxRol2[i] ^ keyY[i]);
-
-        // Convert xor to BigInteger (unsigned)
         byte[] xorLe = new byte[16];
         Array.Copy(xor, 0, xorLe, 0, 16);
         Array.Reverse(xorLe);
@@ -81,11 +105,9 @@ public static class NandCrypto {
         xorLeUnsigned[16] = 0;
         BigInteger xorInt = new BigInteger(xorLeUnsigned);
         BigInteger sumInt = (xorInt + C1) & Mask128;
-
         byte[] sumBytes = sumInt.ToByteArray();
         Array.Resize(ref sumBytes, 16);
         Array.Reverse(sumBytes);
-
         return ROR128(sumBytes, 41);
     }
 
@@ -115,27 +137,30 @@ public static class NandCrypto {
         }
     }
 
+    // AES-CTR via full counter-stream generation + one TransformBlock call.
+    // Accepts data of any length (final partial block handled by XOR truncation).
     public static byte[] AesCtrDecrypt(byte[] key, byte[] counter, byte[] data) {
         using (Aes aes = Aes.Create()) {
             aes.Mode = CipherMode.ECB;
             aes.Padding = PaddingMode.None;
             aes.KeySize = 128;
             aes.Key = key;
-            int numBlocks = (data.Length + 15) / 16;
-            byte[] keystream = new byte[numBlocks * 16];
 
+            int numBlocks = (data.Length + 15) / 16;
+            byte[] ctrStream = new byte[numBlocks * 16];
             byte[] ctr = new byte[16];
             Array.Copy(counter, 0, ctr, 0, 16);
-
-            using (ICryptoTransform enc = aes.CreateEncryptor()) {
-                for (int i = 0; i < numBlocks; i++) {
-                    byte[] block = enc.TransformFinalBlock(ctr, 0, 16);
-                    Array.Copy(block, 0, keystream, i*16, 16);
-                    for (int j = 15; j >= 0; j--) {
-                        ctr[j]++;
-                        if (ctr[j] != 0) break;
-                    }
+            for (int i = 0; i < numBlocks; i++) {
+                Array.Copy(ctr, 0, ctrStream, i * 16, 16);
+                for (int j = 15; j >= 0; j--) {
+                    ctr[j]++;
+                    if (ctr[j] != 0) break;
                 }
+            }
+
+            byte[] keystream = new byte[numBlocks * 16];
+            using (ICryptoTransform enc = aes.CreateEncryptor()) {
+                enc.TransformBlock(ctrStream, 0, ctrStream.Length, keystream, 0);
             }
 
             byte[] result = new byte[data.Length];
@@ -180,262 +205,476 @@ function SubBytes($src, $offset, $length) {
     return $dst
 }
 
+# ReadExactly: keeps reading until $count bytes are filled or EOF.
+# Returns the number of bytes actually read (may be < $count only at EOF).
+function ReadExactly($stream, $buffer, $offset, $count) {
+    $total = 0
+    while ($total -lt $count) {
+        $read = $stream.Read($buffer, $offset + $total, $count - $total)
+        if ($read -le 0) { break }
+        $total += $read
+    }
+    return $total
+}
+
+# Streaming SHA-256 of a file (1MB chunks), returns hex string.
+function Get-FileSha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [System.IO.File]::OpenRead($path)
+        try {
+            $buf = New-Object byte[] 0x100000
+            while ($true) {
+                $read = $fs.Read($buf, 0, $buf.Length)
+                if ($read -le 0) { break }
+                if ($read -eq $buf.Length) {
+                    $null = $sha.TransformBlock($buf, 0, $read, $null, 0)
+                } else {
+                    $null = $sha.TransformFinalBlock($buf, 0, $read)
+                    break
+                }
+            }
+            if (-not $sha.Hash) {
+                $null = $sha.TransformFinalBlock([byte[]]::new(0), 0, 0)
+            }
+            return (BytesToHex $sha.Hash)
+        } finally {
+            $fs.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+# Unified OTP plaintext validation: length + DEADB00F magic + SHA256 + dev flag vs Mode.
+function Assert-ValidOtpPlain([byte[]]$plain, [string]$mode, [string]$sourceDesc) {
+    if ($plain.Length -ne 0x100) {
+        throw "OTP ${sourceDesc}: expected exactly 0x100 (256) bytes, got $($plain.Length)"
+    }
+    if (-not ($plain[0] -eq 0x0F -and $plain[1] -eq 0xB0 -and $plain[2] -eq 0xAD -and $plain[3] -eq 0xDE)) {
+        throw "OTP ${sourceDesc}: DEADB00F magic not found. Not a valid (decrypted) OTP, or wrong mode key."
+    }
+    $head = SubBytes $plain 0 0xE0
+    $hash = [NandCrypto]::Sha256($head)
+    $tail = SubBytes $plain 0xE0 0x20
+    $match = $true
+    for ($i = 0; $i -lt 32; $i++) {
+        if ($hash[$i] -ne $tail[$i]) { $match = $false; break }
+    }
+    if (-not $match) {
+        throw "OTP ${sourceDesc}: SHA256 integrity check failed (first 0xE0 bytes do not hash to the tail 0x20)."
+    }
+    $devFlag = [int]$plain[0x19]   # 0 = retail, non-zero = dev (3dbrew OTP_Registers)
+    $otpIsDev = ($devFlag -ne 0)
+    $modeIsDev = ($mode -eq "dev")
+    if ($otpIsDev -ne $modeIsDev) {
+        throw "OTP ${sourceDesc}: dev flag byte 0x$($devFlag.ToString('X2')) is inconsistent with -Mode $mode. " +
+              "Refusing to derive keys with mismatched keyblob."
+    }
+    Write-Host "    OTP dev flag: 0x$($devFlag.ToString('X2')) (consistent with -Mode $mode)" -ForegroundColor DarkGray
+}
+
 # === Main ===
-Write-Host "=== DecryptCTRNand ===" -ForegroundColor Cyan
+Write-Host "=== DecryptCTRNand v0.2 ===" -ForegroundColor Cyan
 Write-Host "NAND: $NandFile"
 Write-Host "boot9: $Boot9File"
 Write-Host "OTP: $OtpFile"
 Write-Host "Mode: $Mode"
 
-# Read inputs
-$boot9Full = [System.IO.File]::ReadAllBytes($Boot9File)
-$otpRaw = [System.IO.File]::ReadAllBytes($OtpFile)
-
-# Step 1: OTP
 $isDev = ($Mode -eq "dev")
+$nandFs = $null
+$tmpFiles = @()
 
-if ($OtpDecrypted) {
-    Write-Host "`n[*] Using pre-decrypted OTP"
-    $otpPlain = $otpRaw
-} else {
-    Write-Host "`n[*] Decrypting OTP..."
+try {
+    # ---- Input validation ----
+    if (-not (Test-Path -LiteralPath $NandFile -PathType Leaf)) { throw "NAND file not found: $NandFile" }
+    if (-not (Test-Path -LiteralPath $Boot9File -PathType Leaf)) { throw "boot9 file not found: $Boot9File" }
+    if (-not (Test-Path -LiteralPath $OtpFile -PathType Leaf)) { throw "OTP file not found: $OtpFile" }
 
-    # dev: nk@0xD700, iv@0xD710; retail: nk@0xD6E0, iv@0xD6F0
-    $nkOff = if ($isDev) { 0xD700 } else { 0xD6E0 }
-    $ivOff = if ($isDev) { 0xD710 } else { 0xD6F0 }
-
-    $nk = SubBytes $boot9Full $nkOff 16
-    $iv = SubBytes $boot9Full $ivOff 16
-
-    $plain = [NandCrypto]::AesCbcDecrypt($nk, $iv, $otpRaw)
-
-    # Check magic (DEADB00F little-endian)
-    if (-not ($plain[0] -eq 0x0F -and $plain[1] -eq 0xB0 -and $plain[2] -eq 0xAD -and $plain[3] -eq 0xDE)) {
-        throw "OTP magic mismatch. Decryption failed."
+    $boot9Full = [System.IO.File]::ReadAllBytes($Boot9File)
+    if ($boot9Full.Length -ne 0x10000 -and $boot9Full.Length -ne 0x8000) {
+        throw "boot9.bin: expected 0x10000 (64KB) or 0x8000 (32KB) bytes, got $($boot9Full.Length)"
     }
 
-    # Verify SHA256
-    $plainHead = SubBytes $plain 0 0xE0
-    $hash = [NandCrypto]::Sha256($plainHead)
-    $tail = SubBytes $plain 0xE0 0x20
-
-    $match = $true
-    for ($i = 0; $i -lt 32; $i++) {
-        if ($hash[$i] -ne $tail[$i]) { $match = $false; break }
+    $otpRaw = [System.IO.File]::ReadAllBytes($OtpFile)
+    if ($otpRaw.Length -ne 0x100) {
+        throw "OTP: expected exactly 0x100 (256) bytes, got $($otpRaw.Length)"
     }
 
-    if (-not $match) {
-        throw "OTP SHA256 integrity check failed."
+    $nandLen = (Get-Item -LiteralPath $NandFile).Length
+    if ($nandLen -lt 0x200) {
+        throw "NAND: file too small to contain an NCSD header (< 0x200 bytes)"
     }
 
-    Write-Host "[+] OTP decrypted successfully ($Mode)" -ForegroundColor Green
-    Write-Host "    Dev flag: 0x$($plain[0x19].ToString('X2'))"
-    $otpPlain = $plain
-}
+    # ---- Step 1: OTP ----
+    if ($OtpDecrypted) {
+        Write-Host "`n[*] Using pre-decrypted OTP (validating anyway)"
+        $otpPlain = $otpRaw
+        Assert-ValidOtpPlain $otpPlain $Mode "from file"
+        Write-Host "[+] OTP plaintext valid ($Mode)" -ForegroundColor Green
+    } else {
+        Write-Host "`n[*] Decrypting OTP..."
 
-# Step 2: CID
-if ($CidFile) {
-    $cid = [System.IO.File]::ReadAllBytes($CidFile)
-    Write-Host "`n[+] CID loaded from file"
-} elseif ($CidHex) {
-    $cid = New-Object byte[] ($CidHex.Length / 2)
-    for ($i = 0; $i -lt $CidHex.Length; $i += 2) {
-        $cid[$i/2] = [Convert]::ToByte($CidHex.Substring($i, 2), 16)
+        # OTP key/IV offsets inside boot9. For a 64KB GM9 dump the blobs live at
+        # +0x8000 relative to the 32KB base; for a 32KB prot-only dump use base.
+        # dev: nk,iv at 0x5700/0x5710 (32KB) or 0xD700/0xD710 (64KB)
+        # retail: nk,iv at 0x56E0/0x56F0 (32KB) or 0xD6E0/0xD6F0 (64KB)
+        $otpBase = 0x8000
+        if ($boot9Full.Length -eq 0x8000) { $otpBase = 0 }
+        $nkOff = if ($isDev) { $otpBase + 0x5700 } else { $otpBase + 0x56E0 }
+        $ivOff = $nkOff + 0x10
+
+        $nk = SubBytes $boot9Full $nkOff 16
+        $iv = SubBytes $boot9Full $ivOff 16
+
+        $plain = [NandCrypto]::AesCbcDecrypt($nk, $iv, $otpRaw)
+        Assert-ValidOtpPlain $plain $Mode "decrypted"
+        Write-Host "[+] OTP decrypted successfully ($Mode)" -ForegroundColor Green
+        $otpPlain = $plain
     }
-    Write-Host "`n[+] CID from hex"
-} else {
-    Write-Host "`n[!] No CID provided." -ForegroundColor Red
-    Write-Host "    NAND AES-CTR nonce = SHA256(CID)[:16], 128-bit, cannot brute-force." -ForegroundColor Red
-    Write-Host "    Please provide -CidFile or -CidHex." -ForegroundColor Red
-    exit 1
-}
 
-# Step 3: NCSD parse
-Write-Host "`n[*] Parsing NCSD header..."
-$nandFs = [System.IO.File]::OpenRead($NandFile)
-$ncsdHeader = New-Object byte[] 0x200
-$nandFs.Read($ncsdHeader, 0, 0x200) | Out-Null
-
-$magic = [System.Text.Encoding]::ASCII.GetString($ncsdHeader, 0x100, 4)
-if ($magic -ne "NCSD") {
-    $nandFs.Close()
-    throw "NCSD magic not found at 0x100. Got: $magic"
-}
-
-Write-Host "[+] NCSD magic found at +0x100" -ForegroundColor Green
-
-$partitions = @()
-for ($i = 0; $i -lt 8; $i++) {
-    $fstype = $ncsdHeader[0x110 + $i]
-    $crypttype = $ncsdHeader[0x118 + $i]
-    $offset = [BitConverter]::ToUInt32($ncsdHeader, 0x120 + $i*8)
-    $size = [BitConverter]::ToUInt32($ncsdHeader, 0x120 + $i*8 + 4)
-
-    if ($fstype -ne 0 -or $crypttype -ne 0) {
-        $absOffset = $offset * 0x200
-        $absSize = $size * 0x200
-
-        # Determine AES slot
-        $slot = 0
-        if ($crypttype -eq 1) { $slot = 0x03 }
-        elseif ($crypttype -eq 2) {
-            if ($fstype -eq 4) { $slot = 0x07 }
-            else { $slot = 0x06 }
-            # Old3DS CTRNAND: crypttype=2, fstype=1, byte offset > 0xB00000
-            if ($fstype -eq 1 -and $absOffset -gt 0xB00000) { $slot = 0x04 }
+    # ---- Step 2: CID ----
+    if ($CidFile) {
+        if (-not (Test-Path -LiteralPath $CidFile -PathType Leaf)) { throw "CID file not found: $CidFile" }
+        $cid = [System.IO.File]::ReadAllBytes($CidFile)
+        if ($cid.Length -ne 16) {
+            throw "CID file: expected exactly 16 bytes, got $($cid.Length)"
         }
-        elseif ($crypttype -eq 3) { $slot = 0x05 }
-        else { $slot = 0x04 }
+        Write-Host "`n[+] CID loaded from file (16 bytes, hidden)"
+    } elseif ($CidHex) {
+        if ($CidHex -notmatch '^[0-9a-fA-F]{32}$') {
+            throw "CID hex: expected exactly 32 hex characters, got '$CidHex'"
+        }
+        $cid = New-Object byte[] 16
+        for ($i = 0; $i -lt 32; $i += 2) {
+            $cid[$i/2] = [Convert]::ToByte($CidHex.Substring($i, 2), 16)
+        }
+        Write-Host "`n[+] CID from hex (hidden)"
+    } else {
+        Write-Host "`n[!] No CID provided." -ForegroundColor Red
+        Write-Host "    NAND AES-CTR nonce = SHA256(CID)[:16], 128-bit, cannot brute-force." -ForegroundColor Red
+        Write-Host "    Please provide -CidFile or -CidHex." -ForegroundColor Red
+        exit 1
+    }
+
+    # ---- Step 3: NCSD parse (with boundary validation) ----
+    Write-Host "`n[*] Parsing NCSD header..."
+    $nandFs = [System.IO.File]::OpenRead($NandFile)
+    $ncsdHeader = New-Object byte[] 0x200
+    $headerRead = ReadExactly $nandFs $ncsdHeader 0 0x200
+    if ($headerRead -lt 0x200) {
+        throw "NAND: truncated NCSD header (read $headerRead of 0x200 bytes)"
+    }
+
+    $magic = [System.Text.Encoding]::ASCII.GetString($ncsdHeader, 0x100, 4)
+    if ($magic -ne "NCSD") {
+        throw "NCSD magic not found at +0x100. Got: '$magic'"
+    }
+    Write-Host "[+] NCSD magic found at +0x100" -ForegroundColor Green
+
+    # NCSD image size field (media units) - informational
+    $ncsdSizeUnits = [BitConverter]::ToUInt32($ncsdHeader, 0x104)
+    $ncsdSizeBytes = [uint64]$ncsdSizeUnits * 0x200
+    if ($ncsdSizeUnits -ne 0 -and $ncsdSizeBytes -gt [uint64]$nandLen) {
+        Write-Host "    [!] NCSD header declares size 0x$($ncsdSizeBytes.ToString('X')) > file length; dump may be truncated" -ForegroundColor Yellow
+    }
+
+    $partitions = @()
+    for ($i = 0; $i -lt 8; $i++) {
+        $fstype = $ncsdHeader[0x110 + $i]
+        $crypttype = $ncsdHeader[0x118 + $i]
+        $offsetUnits = [BitConverter]::ToUInt32($ncsdHeader, 0x120 + $i*8)
+        $sizeUnits = [BitConverter]::ToUInt32($ncsdHeader, 0x120 + $i*8 + 4)
+
+        if ($fstype -eq 0 -and $crypttype -eq 0) { continue }
+
+        $absOffset = [uint64]$offsetUnits * 0x200
+        $absSize = [uint64]$sizeUnits * 0x200
+
+        if ($absOffset -lt 0x200) {
+            Write-Host "    [!] Partition $i : bogus offset 0x$($absOffset.ToString('X')) (overlaps NCSD header), skipped" -ForegroundColor Yellow
+            continue
+        }
+        if ($absSize -eq 0) {
+            Write-Host "    [!] Partition $i : zero size, skipped" -ForegroundColor Yellow
+            continue
+        }
+        $absEnd = $absOffset + $absSize
+        if ($absEnd -gt [uint64]$nandLen) {
+            throw "Partition $i : offset+size 0x$($absEnd.ToString('X')) exceeds NAND file length 0x$($nandLen.ToString('X')). " +
+                  "NAND dump is truncated or the partition table is corrupt."
+        }
+
+        # --- AES slot mapping (rule-based, refuses unknowns) ---
+        # crypt 0x01 = TWL (slot 0x03, different nonce scheme - not implemented here)
+        # crypt 0x02: fs 0x01 = Old3DS CTRNAND -> slot 0x04
+        #             fs 0x03 = FIRM           -> slot 0x06
+        #             fs 0x04 = AGB_FIRM save  -> slot 0x07
+        # crypt 0x03 = New3DS CTRNAND         -> slot 0x05
+        $slot = 0
+        $status = "decrypt"
+        if ($crypttype -eq 1) {
+            $slot = 0x03
+            $status = "unsupported"   # TWL nonce scheme not implemented
+        } elseif ($crypttype -eq 2) {
+            if ($fstype -eq 1) { $slot = 0x04 }
+            elseif ($fstype -eq 3) { $slot = 0x06 }
+            elseif ($fstype -eq 4) { $slot = 0x07 }
+            else { $status = "unknown" }
+        } elseif ($crypttype -eq 3) {
+            $slot = 0x05
+        } else {
+            $status = "unknown"
+        }
+
+        if ($status -eq "unknown") {
+            Write-Host "    [!] Partition $i : unsupported combo fs=0x$($fstype.ToString('X2')) crypt=0x$($crypttype.ToString('X2')) - not decrypting (no guessed slot)" -ForegroundColor Yellow
+        }
 
         $partitions += @{
             Index = $i
             FSType = $fstype
             CryptType = $crypttype
-            Offset = $absOffset
-            Size = $absSize
+            Offset = [long]$absOffset
+            Size = [long]$absSize
             Slot = $slot
+            Status = $status
         }
 
-        Write-Host "    Partition $i : slot=0x$($slot.ToString('X2')) offset=0x$($absOffset.ToString('X8')) size=0x$($absSize.ToString('X8'))"
+        $slotTxt = if ($status -eq "unknown") { "--" } else { "0x$($slot.ToString('X2'))" }
+        Write-Host "    Partition $i : slot=$slotTxt offset=0x$($absOffset.ToString('X8')) size=0x$($absSize.ToString('X8')) [$status]"
     }
-}
 
-# Step 4: Keyinit (ported from pyctr, validated on SPR)
-Write-Host "`n[*] Keyinit (OTP + boot9 -> console-unique normalKeys)..."
-
-# 64KB boot9 -> take last 32KB
-if ($boot9Full.Length -eq 0x10000) {
-    $b9 = SubBytes $boot9Full 0x8000 0x8000
-} else {
-    $b9 = $boot9Full
-}
-
-# keyblob offset: retail=0x5860, dev=0x5C60
-$keyblobOffset = if ($isDev) { 0x5C60 } else { 0x5860 }
-
-# b9_extdata_keygen = first 0x200 bytes of keyblob
-$b9ExtdataKeygen = SubBytes $b9 $keyblobOffset 0x200
-
-# b9_extdata_otp = first 0x24 bytes (CRITICAL: 0x24, not 0x20!)
-$b9ExtdataOtp = SubBytes $b9ExtdataKeygen 0 0x24
-
-# console_key_xy = SHA256(OTP_dec[0x90:0xAC] + b9_extdata_otp)
-$otpSeed = SubBytes $otpPlain 0x90 0x1C
-$seedPlusOtp = New-Object byte[] ($otpSeed.Length + $b9ExtdataOtp.Length)
-[Array]::Copy($otpSeed, 0, $seedPlusOtp, 0, $otpSeed.Length)
-[Array]::Copy($b9ExtdataOtp, 0, $seedPlusOtp, $otpSeed.Length, $b9ExtdataOtp.Length)
-$consoleKeyXy = [NandCrypto]::Sha256($seedPlusOtp)
-
-# slot0x3F KeyX / KeyY -> scramble to normalKey
-$slot3fKeyX = SubBytes $consoleKeyXy 0 16
-$slot3fKeyY = SubBytes $consoleKeyXy 16 16
-$slot3fNormalKey = [NandCrypto]::Scramble($slot3fKeyX, $slot3fKeyY)
-
-Write-Host "    slot0x3F normalKey derived" -ForegroundColor DarkGray
-
-# gen() function: AES-CBC ENCRYPT (not decrypt!)
-$script:extdataOff = 0
-function Gen($n) {
-    $script:extdataOff += 36
-    $iv = SubBytes $script:b9ExtdataKeygen $script:extdataOff 16
-    $script:extdataOff += 16
-    $data = SubBytes $script:b9ExtdataKeygen $script:extdataOff 64
-    $encrypted = [NandCrypto]::AesCbcEncrypt($script:slot3fNormalKey, $iv, $data)
-    $script:extdataOff += $n
-    return $encrypted
-}
-
-$a = Gen 64
-$slot04_07_KeyX = SubBytes $a 0 16
-
-# KeyY from keyblob at offset 0x1F0 (slots 0x04, 0x06, 0x07)
-# Note: slot0x05 (New3DS CTRNAND) uses a FIXED global KeyY, not from keyblob
-# Fixed CTRNANDNew KeyY: 0x4D804F4E9990194613A204AC584460BE (same for dev/retail)
-$keyblob = SubBytes $b9 $keyblobOffset 0x400
-$fixedKeyY_CtrnandNew = [byte[]]::new(16)
-$hex = "4D804F4E9990194613A204AC584460BE"
-for ($i = 0; $i -lt 16; $i++) {
-    $fixedKeyY_CtrnandNew[$i] = [Convert]::ToByte($hex.Substring($i*2, 2), 16)
-}
-
-$normalKeys = @{}
-# slot0x04: keyblob[0x1F0]
-$keyy_04 = SubBytes $keyblob 0x1F0 16
-$normalKeys[0x04] = [NandCrypto]::Scramble($slot04_07_KeyX, $keyy_04)
-# slot0x05: FIXED KeyY (New3DS CTRNAND)
-$normalKeys[0x05] = [NandCrypto]::Scramble($slot04_07_KeyX, $fixedKeyY_CtrnandNew)
-# slot0x06: keyblob[0x210]
-$keyy_06 = SubBytes $keyblob 0x210 16
-$normalKeys[0x06] = [NandCrypto]::Scramble($slot04_07_KeyX, $keyy_06)
-# slot0x07: keyblob[0x220]
-$keyy_07 = SubBytes $keyblob 0x220 16
-$normalKeys[0x07] = [NandCrypto]::Scramble($slot04_07_KeyX, $keyy_07)
-
-Write-Host "`n[+] Derived normalKeys:" -ForegroundColor Green
-foreach ($slot in ($normalKeys.Keys | Sort-Object)) {
-    Write-Host "    slot 0x$($slot.ToString('X2')): $(BytesToHex $normalKeys[$slot])"
-}
-
-# Step 5: Derive nonce
-$nonce = [NandCrypto]::Sha256($cid)[0..15]
-Write-Host "`n[+] CTR nonce (SHA256(CID)[:16]): $(BytesToHex $nonce)"
-
-# Step 6: Decrypt partitions (if OutDir specified)
-if ($OutDir) {
-    Write-Host "`n[*] Decrypting partitions to: $OutDir" -ForegroundColor Cyan
-    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-
-    foreach ($p in $partitions) {
-        $slot = $p.Slot
-        if (-not $normalKeys.ContainsKey($slot)) {
-            Write-Host "    Partition $($p.Index): slot 0x$($slot.ToString('X2')) not derived, skipping" -ForegroundColor Yellow
-            continue
+    # Overlap check between non-empty partition-table entries
+    for ($a = 0; $a -lt $partitions.Count; $a++) {
+        for ($b = $a + 1; $b -lt $partitions.Count; $b++) {
+            $pa = $partitions[$a]
+            $pb = $partitions[$b]
+            $aStart = [uint64]$pa.Offset
+            $aEnd = $aStart + [uint64]$pa.Size
+            $bStart = [uint64]$pb.Offset
+            $bEnd = $bStart + [uint64]$pb.Size
+            if (-not ($aEnd -le $bStart -or $bEnd -le $aStart)) {
+                throw "Partition table overlap: partition $($pa.Index) [0x$($aStart.ToString('X'))-0x$($aEnd.ToString('X'))] " +
+                      "and partition $($pb.Index) [0x$($bStart.ToString('X'))-0x$($bEnd.ToString('X'))]"
+            }
         }
-
-        $nk = $normalKeys[$slot]
-        $outFile = Join-Path $OutDir "partition_$($p.Index)_slot$($slot.ToString('X2')).bin"
-
-        Write-Host "    Partition $($p.Index) (slot 0x$($slot.ToString('X2')))... " -NoNewline
-
-        $nandFs.Seek($p.Offset, [System.IO.SeekOrigin]::Begin) | Out-Null
-        $outFs = [System.IO.File]::Create($outFile)
-
-        $remaining = $p.Size
-        $chunkSize = 0x100000
-        $buf = New-Object byte[] $chunkSize
-
-        while ($remaining -gt 0) {
-            $toRead = [Math]::Min($chunkSize, $remaining)
-            $read = $nandFs.Read($buf, 0, $toRead)
-            if ($read -eq 0) { break }
-
-            $absOff = $p.Offset + ($p.Size - $remaining)
-            $blockOffset = [long]($absOff / 16)
-            $counter = [NandCrypto]::AddCounter($nonce, $blockOffset)
-
-            $decBuf = $buf[0..($read-1)]
-            $decrypted = [NandCrypto]::AesCtrDecrypt($nk, $counter, $decBuf)
-            $outFs.Write($decrypted, 0, $decrypted.Length)
-
-            $remaining -= $read
-        }
-
-        $outFs.Close()
-        Write-Host "saved ($([Math]::Round($p.Size / 1MB, 1)) MB)" -ForegroundColor Green
     }
+
+    # ---- Step 4: Keyinit (ported from pyctr, validated on SPR) ----
+    Write-Host "`n[*] Keyinit (OTP + boot9 -> console-unique normalKeys)..."
+    $b9 = if ($boot9Full.Length -eq 0x10000) { SubBytes $boot9Full 0x8000 0x8000 } else { $boot9Full }
+
+    # keyblob offset in the last-32KB coordinate space: retail=0x5860, dev=0x5C60
+    $keyblobOffset = if ($isDev) { 0x5C60 } else { 0x5860 }
+
+    $b9ExtdataKeygen = SubBytes $b9 $keyblobOffset 0x200
+    $b9ExtdataOtp = SubBytes $b9ExtdataKeygen 0 0x24
+
+    # console_key_xy = SHA256(OTP_dec[0x90:0xAC] + b9_extdata_otp)
+    $otpSeed = SubBytes $otpPlain 0x90 0x1C
+    $seedPlusOtp = New-Object byte[] ($otpSeed.Length + $b9ExtdataOtp.Length)
+    [Array]::Copy($otpSeed, 0, $seedPlusOtp, 0, $otpSeed.Length)
+    [Array]::Copy($b9ExtdataOtp, 0, $seedPlusOtp, $otpSeed.Length, $b9ExtdataOtp.Length)
+    $consoleKeyXy = [NandCrypto]::Sha256($seedPlusOtp)
+
+    $slot3fKeyX = SubBytes $consoleKeyXy 0 16
+    $slot3fKeyY = SubBytes $consoleKeyXy 16 16
+    $slot3fNormalKey = [NandCrypto]::Scramble($slot3fKeyX, $slot3fKeyY)
+    Write-Host "    slot0x3F normalKey derived" -ForegroundColor DarkGray
+
+    # gen() function: AES-CBC ENCRYPT (not decrypt!)
+    $script:extdataOff = 0
+    function Gen($n) {
+        $script:extdataOff += 36
+        $iv = SubBytes $script:b9ExtdataKeygen $script:extdataOff 16
+        $script:extdataOff += 16
+        $data = SubBytes $script:b9ExtdataKeygen $script:extdataOff 64
+        $encrypted = [NandCrypto]::AesCbcEncrypt($script:slot3fNormalKey, $iv, $data)
+        $script:extdataOff += $n
+        return $encrypted
+    }
+
+    $a = Gen 64
+    $slot04_07_KeyX = SubBytes $a 0 16
+
+    $keyblob = SubBytes $b9 $keyblobOffset 0x400
+    $fixedKeyY_CtrnandNew = [byte[]]::new(16)
+    $hex = "4D804F4E9990194613A204AC584460BE"
+    for ($i = 0; $i -lt 16; $i++) {
+        $fixedKeyY_CtrnandNew[$i] = [Convert]::ToByte($hex.Substring($i*2, 2), 16)
+    }
+
+    $normalKeys = @{}
+    $normalKeys[0x04] = [NandCrypto]::Scramble($slot04_07_KeyX, (SubBytes $keyblob 0x1F0 16))
+    $normalKeys[0x05] = [NandCrypto]::Scramble($slot04_07_KeyX, $fixedKeyY_CtrnandNew)
+    $normalKeys[0x06] = [NandCrypto]::Scramble($slot04_07_KeyX, (SubBytes $keyblob 0x210 16))
+    $normalKeys[0x07] = [NandCrypto]::Scramble($slot04_07_KeyX, (SubBytes $keyblob 0x220 16))
+
+    if ($ShowKeys) {
+        Write-Host "`n[+] Derived normalKeys:" -ForegroundColor Green
+        foreach ($slot in ($normalKeys.Keys | Sort-Object)) {
+            Write-Host "    slot 0x$($slot.ToString('X2')): $(BytesToHex $normalKeys[$slot])"
+        }
+    } else {
+        Write-Host "`n[+] Derived normalKeys (slots 0x04-0x07): OK (hidden; use -ShowKeys to display)" -ForegroundColor Green
+    }
+
+    # ---- Step 5: Derive nonce ----
+    $nonce = [NandCrypto]::Sha256($cid)[0..15]
+    Write-Host "`n[+] CTR nonce derived (SHA256(CID)[:16], hidden)" -ForegroundColor Green
+
+    # ---- Step 6: Decrypt partitions (if OutDir specified) ----
+    if ($OutDir) {
+        Write-Host "`n[*] Decrypting partitions to: $OutDir" -ForegroundColor Cyan
+        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+
+        foreach ($p in $partitions) {
+            if ($p.Status -eq "unknown") {
+                Write-Host "    Partition $($p.Index): unknown crypt/fs type, skipped" -ForegroundColor Yellow
+                continue
+            }
+            $slot = $p.Slot
+            if (-not $normalKeys.ContainsKey($slot)) {
+                Write-Host "    Partition $($p.Index): slot 0x$($slot.ToString('X2')) not derived ($($p.Status)), skipping" -ForegroundColor Yellow
+                continue
+            }
+
+            $nk = $normalKeys[$slot]
+            $outFile = Join-Path $OutDir "partition_$($p.Index)_slot$($slot.ToString('X2')).bin"
+            $tmpFile = "$outFile.tmp"
+
+            if (Test-Path -LiteralPath $outFile -PathType Leaf) {
+                if (-not $Force) {
+                    throw "Output already exists: $outFile . Re-run with -Force to overwrite."
+                }
+                Remove-Item -LiteralPath $outFile -Force
+            }
+            if (Test-Path -LiteralPath $tmpFile -PathType Leaf) {
+                Remove-Item -LiteralPath $tmpFile -Force
+            }
+
+            Write-Host "    Partition $($p.Index) (slot 0x$($slot.ToString('X2')))... " -NoNewline
+
+            $outFs = $null
+            try {
+                $nandFs.Seek($p.Offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+                $outFs = [System.IO.File]::Create($tmpFile)
+                $tmpFiles += $tmpFile
+
+                $remaining = $p.Size
+                $chunkSize = 0x100000
+                $buf = New-Object byte[] $chunkSize
+                $written = 0L
+
+                while ($remaining -gt 0) {
+                    $toRead = [Math]::Min($chunkSize, $remaining)
+                    $read = ReadExactly $nandFs $buf 0 $toRead
+                    if ($read -lt $toRead) {
+                        throw "Partition $($p.Index): NAND truncated - expected $toRead bytes, got $read (partition would be incomplete)"
+                    }
+
+                    $absOff = $p.Offset + ($p.Size - $remaining)
+                    $blockOffset = [long]($absOff / 16)
+                    $counter = [NandCrypto]::AddCounter($nonce, $blockOffset)
+
+                    $decBuf = $buf[0..($read-1)]
+                    $decrypted = [NandCrypto]::AesCtrDecrypt($nk, $counter, $decBuf)
+                    $outFs.Write($decrypted, 0, $decrypted.Length)
+                    $written += $decrypted.Length
+
+                    $remaining -= $read
+                }
+
+                if ($written -ne $p.Size) {
+                    throw "Partition $($p.Index): wrote $written bytes but expected $($p.Size) (incomplete output)"
+                }
+
+                $outFs.Flush()
+                $outFs.Dispose()
+                $outFs = $null
+
+                # ---- Structural checks (sanity only; AES-CTR is not authenticated) ----
+                $checkOk = $true
+                $checkNote = ""
+                if ($slot -eq 0x04 -or $slot -eq 0x05) {
+                    # CTRNAND: first sector must be an MBR with 55AA signature at 0x1FE
+                    $head = New-Object byte[] 0x200
+                    $hfs = [System.IO.File]::OpenRead($tmpFile)
+                    try {
+                        $hr = ReadExactly $hfs $head 0 0x200
+                        if ($hr -ge 0x200 -and $head[0x1FE] -eq 0x55 -and $head[0x1FF] -eq 0xAA) {
+                            $checkNote = "MBR 55AA OK"
+                        } else {
+                            $checkOk = $false
+                            $checkNote = "MBR 55AA MISSING (wrong key/offset?)"
+                        }
+                    } finally {
+                        $hfs.Dispose()
+                    }
+                } elseif ($slot -eq 0x06) {
+                    # FIRM partition: magic 'FIRM' at +0x100
+                    $head = New-Object byte[] 0x104
+                    $hfs = [System.IO.File]::OpenRead($tmpFile)
+                    try {
+                        $hr = ReadExactly $hfs $head 0 0x104
+                        $firm = [System.Text.Encoding]::ASCII.GetString($head, 0x100, 4)
+                        if ($hr -ge 0x104 -and $firm -eq "FIRM") {
+                            $checkNote = "FIRM magic OK"
+                        } else {
+                            $checkOk = $false
+                            $checkNote = "FIRM magic MISSING (wrong key/offset?)"
+                        }
+                    } finally {
+                        $hfs.Dispose()
+                    }
+                } else {
+                    $checkNote = "no structural check defined (slot 0x$($slot.ToString('X2')))"
+                }
+
+                if (-not $checkOk) {
+                    if (Test-Path -LiteralPath $tmpFile) { Remove-Item -LiteralPath $tmpFile -Force }
+                    throw "Partition $($p.Index): structural check failed - $checkNote"
+                }
+
+                # SHA-256 record for cross-run comparison
+                $shaHex = Get-FileSha256 $tmpFile
+
+                # Commit: rename .tmp to final name (overwrite already handled)
+                [System.IO.File]::Move($tmpFile, $outFile)
+                $tmpFiles = $tmpFiles | Where-Object { $_ -ne $tmpFile }
+
+                Write-Host "saved ($([Math]::Round($p.Size / 1MB, 1)) MB, wrote $written bytes, $checkNote)" -ForegroundColor Green
+                Write-Host "        SHA-256: $shaHex" -ForegroundColor DarkGray
+            } finally {
+                if ($outFs) { $outFs.Dispose() }
+                if (Test-Path -LiteralPath $tmpFile) { Remove-Item -LiteralPath $tmpFile -Force }
+            }
+        }
+    } else {
+        Write-Host "`n[*] No -OutDir specified: keys derived, partitions not written to disk." -ForegroundColor Yellow
+    }
+
+    # === Summary ===
+    Write-Host "`n=== Summary ===" -ForegroundColor Cyan
+    Write-Host "OTP: valid ($Mode)"
+    Write-Host "NCSD: parsed, $($partitions.Count) non-empty partition(s)"
+    Write-Host "CID: loaded (hidden)"
+    Write-Host "Keyinit: completed (slots 0x04-0x07)"
+    Write-Host "nonce: derived"
+    if ($OutDir) {
+        Write-Host "Partitions: decrypted to $OutDir (structural checks applied)"
+        Write-Host "Note: AES-CTR provides no integrity authentication; checks are structural sanity checks only." -ForegroundColor DarkGray
+    } else {
+        Write-Host "Partitions: not decrypted (no -OutDir)"
+    }
+    Write-Host "`nDone." -ForegroundColor Cyan
 }
-
-$nandFs.Close()
-
-# === Summary ===
-Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-Write-Host "OTP: decrypted OK ($Mode)"
-Write-Host "NCSD: parsed, $($partitions.Count) partitions OK"
-Write-Host "CID: loaded OK"
-Write-Host "Keyinit: completed OK (slots 0x04-0x07)"
-Write-Host "nonce: derived OK"
-if ($OutDir) {
-    Write-Host "Partitions: decrypted to $OutDir"
-} else {
-    Write-Host "`n[*] No -OutDir specified, keys derived but partitions not written to disk." -ForegroundColor Yellow
+catch {
+    Write-Host "`n[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "`nDecryption aborted; no incomplete partition files were left behind." -ForegroundColor Yellow
+    exit 1
+}
+finally {
+    if ($nandFs) { $nandFs.Dispose() }
 }
