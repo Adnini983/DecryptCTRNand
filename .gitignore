@@ -1,5 +1,6 @@
-# build intermediates
+# build intermediates (the compiled jar is NOT committed; build via java\build.bat)
 java/classes/
+*.jar
 
 # test run output (vectors/ and expected/ are committed for instant cross-check)
 tests/out/

@@ -19,7 +19,11 @@
 
 - **主交付 = Windows 原生 BAT + PowerShell**（`DecryptCTRNand.bat` + `DecryptCTRNand.ps1`）：仅用 .NET Framework 内置 Aes / SHA256 / BigInteger，零外部依赖、无需 Python / pip / OpenSSL。
 - **Python 参考实现**（`DecryptCTRNand.py`）：与主交付逐字节等价的交叉验证实现（v0.2 起已具备完整分区解密能力），仅需 `pycryptodome`。
-- **Java 11 GUI**（`java/DecryptCTRNandGUI.jar`）：纯 JDK（Swing + javax.crypto + BigInteger），**零外部依赖，只要有 JRE/JDK 11+ 即可使用**。**直接双击 `.jar` 即可打开 GUI，不需要任何启动器**；同一 jar 也支持与 PS1 参数完全一致的 `--cli` 无头模式。
+- **Java 11 GUI**（`java/DecryptCTRNandGUI.java` → 本地构建 `java\DecryptCTRNandGUI.jar`）：纯 JDK（Swing + javax.crypto + BigInteger），**零外部依赖，只要有 JRE/JDK 11+ 即可使用**。**直接双击 `.jar` 即可打开 GUI，不需要任何启动器**；同一 jar 也支持与 PS1 参数完全一致的 `--cli` 无头模式。
+  - **标签页多任务**：每个标签页是一个独立解密任务，可同时运行（每任务独立日志与取消）。
+  - **路径框拖放**：NAND/boot9/OTP/CID/输出目录输入框可直接把文件或文件夹从资源管理器拖入。
+  - **多语言接口**：内置语言仅「简体中文（默认）/ English」，可通过 `Lang.register(code, entries)` 扩展；GUI 内切换即时生效。
+  - 注意：编译好的 jar **不随仓库提交**（`.gitignore` 已排除 `*.jar`），克隆后先用 `java\build.bat` 本地构建。
 
 ## 运行环境要求
 
@@ -91,6 +95,9 @@ java -jar DecryptCTRNandGUI.jar -NandFile sysnand.bin -Boot9File boot9.bin -OtpF
 ```
 
 - **双击 jar 即 GUI**：`Main-Class` 已写入 manifest，双击调用 `javaw` 打开窗口（需系统已关联 .jar 到 JRE/JDK，标准安装默认关联）。无参数运行时自动进入 GUI。
+- **标签页多任务**：工具栏「＋ 新建任务」开新标签，每个标签是独立任务（文件选择、选项、进度、日志各自独立），可同时解密多台机器/多份 dump；标签可随时关闭（进行中的任务会被取消）。
+- **路径框拖放**：NAND / boot9 / OTP / CID 文件 / 输出目录输入框可直接拖入文件或文件夹。
+- **多语言**：右上角语言下拉框在「简体中文（默认）/ English」间即时切换；接口为 `DecryptCTRNandGUI$Lang`（内置仅这两个语言，可用 `Lang.register(code, entries)` 扩展）。
 - **CLI 与 PS1 参数一致**：`java -jar DecryptCTRNandGUI.jar -NandFile ... -Boot9File ...` 直接可用（`-` 前缀、大小写不敏感），可选再带一个 `--cli` 前缀；旧 `--nand` 风格别名也保留。
 - `DecryptCTRNandGUI.bat` 仅是可选的命令行快捷方式，**非必需**。
 
@@ -164,19 +171,20 @@ python tests\make_testvectors.py
 # 2) 三端交叉验证（PS1 + Python；带上 Java jar 则三端）
 #    对三端的调用统一使用与 PS1 一致的参数名（-NandFile 等）；
 #    Java 不经 --cli 前缀直接调用，验证 jar 的 CLI 入口本身。
+#    注意：jar 是本地构建产物（不入库），运行前先执行 java\build.bat。
 powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1
 powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1 -JavaJar java\DecryptCTRNandGUI.jar
 ```
 
 退出码 0 = 全部通过。
 
-## Java 11 构建（仅当需要重新打包 jar 时）
+## Java 11 构建（jar 为本地产物，不入库）
 
 ```cmd
 java\build.bat
 ```
 
-产物：`java\DecryptCTRNandGUI.jar`（`javac --release 11` 编译，Java 11 字节码；Main-Class manifest）。**分发时只需这一个 jar**：双击即 GUI、`java -jar ... -NandFile ...` 即 CLI；根目录 `DecryptCTRNandGUI.bat` 只是可选快捷方式。
+产物：`java\DecryptCTRNandGUI.jar`（`javac --release 11` 编译，Java 11 字节码；Main-Class manifest）。**jar 是编译产物，已加入 `.gitignore`（`*.jar`）不随仓库提交**——克隆仓库后先本地构建再使用。**分发/使用只需这一个 jar**：双击即 GUI、`java -jar ... -NandFile ...` 即 CLI；根目录 `DecryptCTRNandGUI.bat` 只是可选快捷方式。
 
 ## 方案依据
 

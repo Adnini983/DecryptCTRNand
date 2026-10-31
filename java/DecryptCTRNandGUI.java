@@ -1,7 +1,7 @@
 /*
  * DecryptCTRNandGUI - 3DS NAND Dump Decryptor (Pure JDK 11, zero external deps)
  *
- * v0.2 - Java implementation kept byte-for-byte compatible with
+ * v0.2.1 - Java implementation kept byte-for-byte compatible with
  *        DecryptCTRNand.ps1 / DecryptCTRNand.py (see tests/).
  *
  * Pure JDK only: javax.swing + javax.crypto + java.util.BigInteger.
@@ -11,10 +11,18 @@
  *          -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out -Force
  *     (a leading --cli is also accepted; legacy --nand-style aliases too)
  *
+ * GUI (v0.2.1):
+ *   - Tabbed multi-task: each tab is an independent decryption task; tasks run
+ *     concurrently (per-task log routing + cancellation, ThreadLocal-based).
+ *   - Drag & drop: path fields accept dropped files/folders from the OS.
+ *   - i18n interface (Lang): built-in zh-CN (default) + en only; third-party
+ *     languages can be registered via Lang.register(code, entries).
+ *
  * Build (JDK >= 11; target 11 bytecode):
  *     javac --release 11 -d out/classes DecryptCTRNandGUI.java
  *     jar cfm DecryptCTRNandGUI.jar MANIFEST.MF -C out/classes .
  *     (MANIFEST.MF contains "Main-Class: DecryptCTRNandGUI")
+ *     (the compiled jar is NOT committed to git; build it locally, see build.bat)
  */
 
 import javax.crypto.Cipher;
@@ -22,6 +30,7 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.swing.*;
 import java.awt.*;
+import java.awt.datatransfer.DataFlavor;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
@@ -514,14 +523,17 @@ public class DecryptCTRNandGUI {
         }
     };
 
-    /** Routed log target: CLI by default, swapped to the GUI worker while running. */
-    static volatile Log CURRENT_LOG = CLI_LOG;
+    /** Per-thread routed log target: CLI by default; each GUI task worker sets its
+     *  own, so multiple tabs can decrypt concurrently without log cross-talk. */
+    static final ThreadLocal<Log> CURRENT_LOG = new ThreadLocal<Log>() {
+        protected Log initialValue() {
+            return CLI_LOG;
+        }
+    };
 
     static void log(String line) {
-        CURRENT_LOG.log(line);
+        CURRENT_LOG.get().log(line);
     }
-
-    static java.util.concurrent.atomic.AtomicBoolean CANCELLED = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     // ---------------- pipeline ----------------
     static class Options {
@@ -530,7 +542,8 @@ public class DecryptCTRNandGUI {
     }
 
     /** Full pipeline: OTP -> CID -> NCSD -> keyinit -> nonce -> partitions. */
-    static void runPipeline(Options o, boolean cancelable) throws Exception {
+    static void runPipeline(Options o, boolean cancelable,
+                            java.util.concurrent.atomic.AtomicBoolean cancelled) throws Exception {
         if (o.nand == null || o.nand.isEmpty()) throw new RuntimeException("NAND file required");
         if (o.boot9 == null || o.boot9.isEmpty()) throw new RuntimeException("boot9 file required");
         if (o.otp == null || o.otp.isEmpty()) throw new RuntimeException("OTP file required");
@@ -596,7 +609,7 @@ public class DecryptCTRNandGUI {
             Files.createDirectories(outDir);
             log("[*] Decrypting partitions to: " + o.outdir);
             for (Partition p : parts) {
-                if (CANCELLED.get()) throw new RuntimeException("Cancelled by user.");
+                if (cancelable && cancelled.get()) throw new RuntimeException("Cancelled by user.");
                 if ("unknown".equals(p.status)) {
                     log("    Partition " + p.index + ": unknown crypt/fs type, skipped");
                     continue;
@@ -607,7 +620,7 @@ public class DecryptCTRNandGUI {
                     continue;
                 }
                 decryptPartition(nandPath, p, normalKeys.get(p.slot), nonce, outDir,
-                        o.force, cancelable, CANCELLED);
+                        o.force, cancelable, cancelled);
             }
         }
 
@@ -720,7 +733,7 @@ public class DecryptCTRNandGUI {
             System.exit(1);
         }
         try {
-            runPipeline(o, false);
+            runPipeline(o, false, new java.util.concurrent.atomic.AtomicBoolean(false));
         } catch (Exception e) {
             System.err.println("[ERROR] " + e.getMessage());
             System.err.println("Decryption aborted; no incomplete partition files were left behind.");
@@ -749,46 +762,280 @@ public class DecryptCTRNandGUI {
         });
     }
 
+    // ---------------- i18n ----------------
+    /**
+     * Minimal resource-bundle-style i18n interface. Built-in languages:
+     * "zh-CN" (Simplified Chinese, default) and "en". Third parties may add
+     * languages at runtime via Lang.register(code, entries).
+     */
+    static class Lang {
+        static final java.util.Map<String, java.util.Map<String, String>> DICTS =
+                new java.util.LinkedHashMap<>();
+        static final java.util.List<String> CODES = new ArrayList<>();
+        static String current = "zh-CN";
+        static java.util.Map<String, String> cur;
+
+        static void register(String code, java.util.Map<String, String> entries) {
+            DICTS.put(code, entries);
+            if (!CODES.contains(code)) CODES.add(code);
+        }
+
+        static String t(String key) {
+            if (cur == null) cur = DICTS.get(current);
+            String v = cur == null ? null : cur.get(key);
+            return v != null ? v : key;
+        }
+
+        static void set(String code) {
+            if (DICTS.containsKey(code)) {
+                current = code;
+                cur = DICTS.get(code);
+            }
+        }
+
+        static String displayName(String code) {
+            return "zh-CN".equals(code) ? "简体中文" : "English";
+        }
+
+        static {
+            java.util.Map<String, String> zh = new java.util.HashMap<>();
+            zh.put("title", "DecryptCTRNand v0.2.1 - 3DS NAND 解密工具（纯 JDK 11）");
+            zh.put("newTask", "＋ 新建任务");
+            zh.put("closeTab", "×");
+            zh.put("language", "语言:");
+            zh.put("nand", "NAND dump:");
+            zh.put("boot9", "boot9.bin:");
+            zh.put("otp", "OTP 文件:");
+            zh.put("cidHex", "CID（十六进制）:");
+            zh.put("cidFile", "CID 文件:");
+            zh.put("outdir", "输出目录:");
+            zh.put("mode", "模式:");
+            zh.put("otpDec", "OTP 已是解密明文 (-OtpDecrypted)");
+            zh.put("force", "允许覆盖已有输出 (-Force)");
+            zh.put("showKeys", "显示派生密钥 (-ShowKeys)");
+            zh.put("browse", "浏览…");
+            zh.put("start", "开始解密");
+            zh.put("cancel", "取消");
+            zh.put("working", "处理中…");
+            zh.put("successTitle", "=== 成功 ===");
+            zh.put("successBody", "所有选中分区均已解密并通过校验。");
+            zh.put("cancelTitle", "=== 已取消 ===");
+            zh.put("errorTitle", "=== 错误 ===");
+            zh.put("abortNote", "解密中止；未留下任何不完整的分区文件。");
+            zh.put("dropHint", "可将文件或文件夹拖放到此输入框");
+            zh.put("taskTab", "任务");
+            register("zh-CN", zh);
+
+            java.util.Map<String, String> en = new java.util.HashMap<>();
+            en.put("title", "DecryptCTRNand v0.2.1 - 3DS NAND Decryptor (Pure JDK 11)");
+            en.put("newTask", "+ New Task");
+            en.put("closeTab", "×");
+            en.put("language", "Language:");
+            en.put("nand", "NAND dump:");
+            en.put("boot9", "boot9.bin:");
+            en.put("otp", "OTP file:");
+            en.put("cidHex", "CID (hex):");
+            en.put("cidFile", "CID file:");
+            en.put("outdir", "Output dir:");
+            en.put("mode", "Mode:");
+            en.put("otpDec", "OTP is already decrypted (-OtpDecrypted)");
+            en.put("force", "Force overwrite existing outputs");
+            en.put("showKeys", "Show derived keys (-ShowKeys)");
+            en.put("browse", "Browse...");
+            en.put("start", "Start Decryption");
+            en.put("cancel", "Cancel");
+            en.put("working", "Working...");
+            en.put("successTitle", "=== SUCCESS ===");
+            en.put("successBody", "All selected partitions decrypted and verified.");
+            en.put("cancelTitle", "=== CANCELLED ===");
+            en.put("errorTitle", "=== ERROR ===");
+            en.put("abortNote", "Decryption aborted; no incomplete partition files were left behind.");
+            en.put("dropHint", "You can drag & drop a file or folder onto this field");
+            en.put("taskTab", "Task");
+            register("en", en);
+
+            set("zh-CN"); // default language: Simplified Chinese
+        }
+    }
+
+    /** Drag & drop support for path fields: dropping a file/folder fills the field. */
+    static void enableFileDrop(final JTextField field) {
+        field.setToolTipText(Lang.t("dropHint"));
+        field.setTransferHandler(new TransferHandler() {
+            public boolean canImport(TransferSupport support) {
+                return support.isDrop()
+                        && support.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+            }
+
+            public boolean importData(TransferSupport support) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    java.util.List<File> files = (java.util.List<File>)
+                            support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+                    if (!files.isEmpty()) {
+                        field.setText(files.get(0).getAbsolutePath());
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                    // not a file drop; ignore
+                }
+                return false;
+            }
+        });
+    }
+
+    // ---------------- main frame (tabbed multi-task) ----------------
     static class MainFrame extends JFrame {
-        final JTextField nandField = new JTextField(40);
-        final JTextField boot9Field = new JTextField(40);
-        final JTextField otpField = new JTextField(40);
-        final JTextField cidHexField = new JTextField(40);
-        final JTextField cidFileField = new JTextField(40);
-        final JTextField outdirField = new JTextField(40);
-        final JComboBox<String> modeBox = new JComboBox<>(new String[]{"dev", "retail"});
-        final JCheckBox otpDecBox = new JCheckBox("OTP is already decrypted (-OtpDecrypted)");
-        final JCheckBox forceBox = new JCheckBox("Force overwrite existing outputs");
-        final JCheckBox showKeysBox = new JCheckBox("Show derived keys (hidden by default)");
-        final JProgressBar progress = new JProgressBar(0, 100);
-        final JTextArea logArea = new JTextArea();
-        final JButton startBtn = new JButton("Start Decryption");
-        final JButton cancelBtn = new JButton("Cancel");
-        DecryptTask task;
+        final JTabbedPane tabs = new JTabbedPane();
+        final JButton newTaskBtn = new JButton();
+        final JLabel labLang = new JLabel();
+        final JComboBox<String> langBox =
+                new JComboBox<>(new String[]{Lang.displayName("zh-CN"), Lang.displayName("en")});
 
         MainFrame() {
-            super("DecryptCTRNand v0.2 (Pure JDK 11)");
+            super(Lang.t("title"));
             setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+            setLayout(new BorderLayout());
+
+            JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 6));
+            newTaskBtn.addActionListener(e -> addTask());
+            toolbar.add(newTaskBtn);
+            toolbar.add(labLang);
+            langBox.setSelectedItem(Lang.displayName(Lang.current));
+            langBox.addActionListener(e -> {
+                Lang.set(displayToCode((String) langBox.getSelectedItem()));
+                applyLanguage();
+            });
+            toolbar.add(langBox);
+            add(toolbar, BorderLayout.NORTH);
+
+            add(tabs, BorderLayout.CENTER);
+            addTask();
+
+            applyLanguage();
+            pack();
+            setLocationRelativeTo(null);
+            setMinimumSize(new Dimension(860, 560));
+        }
+
+        String displayToCode(String display) {
+            for (String code : Lang.CODES) {
+                if (Lang.displayName(code).equals(display)) return code;
+            }
+            return Lang.current;
+        }
+
+        void addTask() {
+            int idx = tabs.getTabCount();
+            tabs.addTab("", new TaskPanel(this));
+            tabs.setTabComponentAt(idx, new TabHeader(this, idx));
+            refreshTabTitle(idx);
+            tabs.setSelectedIndex(idx);
+        }
+
+        void closeTab(int idx) {
+            if (idx < 0 || idx >= tabs.getTabCount()) return;
+            TaskPanel p = (TaskPanel) tabs.getComponentAt(idx);
+            if (p.task != null && !p.task.isDone()) {
+                p.cancelled.set(true); // cancel in-flight work, then close the tab
+            }
+            tabs.removeTabAt(idx);
+            refreshAllTabTitles();
+            if (tabs.getTabCount() == 0) addTask(); // always keep at least one task
+        }
+
+        void refreshAllTabTitles() {
+            for (int i = 0; i < tabs.getTabCount(); i++) refreshTabTitle(i);
+        }
+
+        void refreshTabTitle(int i) {
+            TabHeader h = (TabHeader) tabs.getTabComponentAt(i);
+            h.title.setText(Lang.t("taskTab") + " " + (i + 1));
+            h.close.setText(Lang.t("closeTab"));
+        }
+
+        void applyLanguage() {
+            setTitle(Lang.t("title"));
+            newTaskBtn.setText(Lang.t("newTask"));
+            labLang.setText(Lang.t("language"));
+            refreshAllTabTitles();
+            for (int i = 0; i < tabs.getTabCount(); i++) {
+                ((TaskPanel) tabs.getComponentAt(i)).applyLanguage();
+            }
+        }
+
+        /** Close button embedded in each tab header. */
+        static class TabHeader extends JPanel {
+            final JLabel title = new JLabel();
+            final JButton close = new JButton(Lang.t("closeTab"));
+
+            TabHeader(final MainFrame owner, final int idx) {
+                setOpaque(false);
+                setLayout(new FlowLayout(FlowLayout.LEFT, 4, 0));
+                close.setBorder(BorderFactory.createEmptyBorder(0, 2, 0, 2));
+                close.setContentAreaFilled(false);
+                close.setFocusable(false);
+                close.setMargin(new Insets(0, 2, 0, 2));
+                close.addActionListener(e ->
+                        owner.closeTab(owner.tabs.indexOfTabComponent(TabHeader.this)));
+                add(title);
+                add(close);
+            }
+        }
+    }
+
+    // ---------------- per-task panel ----------------
+    static class TaskPanel extends JPanel {
+        final JTextField nandField = new JTextField(36);
+        final JTextField boot9Field = new JTextField(36);
+        final JTextField otpField = new JTextField(36);
+        final JTextField cidHexField = new JTextField(36);
+        final JTextField cidFileField = new JTextField(36);
+        final JTextField outdirField = new JTextField(36);
+        final JComboBox<String> modeBox = new JComboBox<>(new String[]{"dev", "retail"});
+        final JCheckBox otpDecBox = new JCheckBox();
+        final JCheckBox forceBox = new JCheckBox();
+        final JCheckBox showKeysBox = new JCheckBox();
+        final JProgressBar progress = new JProgressBar(0, 100);
+        final JTextArea logArea = new JTextArea();
+        final JButton startBtn = new JButton();
+        final JButton cancelBtn = new JButton();
+        final JButton bNand = new JButton();
+        final JButton bBoot9 = new JButton();
+        final JButton bOtp = new JButton();
+        final JButton bCid = new JButton();
+        final JButton bOutdir = new JButton();
+        final JLabel labNand = new JLabel();
+        final JLabel labBoot9 = new JLabel();
+        final JLabel labOtp = new JLabel();
+        final JLabel labCidHex = new JLabel();
+        final JLabel labCidFile = new JLabel();
+        final JLabel labOutdir = new JLabel();
+        final JLabel labMode = new JLabel();
+        final java.util.concurrent.atomic.AtomicBoolean cancelled =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        boolean running;
+        DecryptTask task;
+
+        TaskPanel(MainFrame owner) {
             setLayout(new BorderLayout());
 
             JPanel form = new JPanel(new GridBagLayout());
             GridBagConstraints c = new GridBagConstraints();
             c.insets = new Insets(4, 6, 4, 6);
             c.anchor = GridBagConstraints.WEST;
-            c.gridx = 0;
-            c.gridy = 0;
 
-            addRow(form, c, 0, "NAND dump:", nandField, "Select NAND");
-            addRow(form, c, 1, "boot9.bin:", boot9Field, "Select boot9");
-            addRow(form, c, 2, "OTP file:", otpField, "Select OTP");
-            addRow(form, c, 3, "CID (hex):", cidHexField, "");
-            addRow(form, c, 4, "CID file:", cidFileField, "Select CID");
-            addRow(form, c, 5, "Output dir:", outdirField, "Select output dir");
+            addRow(form, c, 0, labNand, nandField, bNand, false);
+            addRow(form, c, 1, labBoot9, boot9Field, bBoot9, false);
+            addRow(form, c, 2, labOtp, otpField, bOtp, false);
+            addRow(form, c, 3, labCidHex, cidHexField, null, false);
+            addRow(form, c, 4, labCidFile, cidFileField, bCid, false);
+            addRow(form, c, 5, labOutdir, outdirField, bOutdir, true);
 
             c.gridx = 1;
             c.gridy++;
             JPanel opts = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-            opts.add(new JLabel("Mode:"));
+            opts.add(labMode);
             opts.add(modeBox);
             opts.add(otpDecBox);
             opts.add(forceBox);
@@ -800,12 +1047,11 @@ public class DecryptCTRNandGUI {
             logArea.setEditable(false);
             logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
             JScrollPane scroll = new JScrollPane(logArea);
-            scroll.setPreferredSize(new Dimension(760, 260));
+            scroll.setPreferredSize(new Dimension(700, 220));
             add(scroll, BorderLayout.CENTER);
 
             JPanel south = new JPanel(new BorderLayout());
             progress.setStringPainted(true);
-            progress.setString("");
             progress.setIndeterminate(true);
             progress.setVisible(false);
             south.add(progress, BorderLayout.NORTH);
@@ -816,39 +1062,44 @@ public class DecryptCTRNandGUI {
             south.add(buttons, BorderLayout.CENTER);
             add(south, BorderLayout.SOUTH);
 
+            // drag & drop onto path fields
+            enableFileDrop(nandField);
+            enableFileDrop(boot9Field);
+            enableFileDrop(otpField);
+            enableFileDrop(cidFileField);
+            enableFileDrop(outdirField);
+
             startBtn.addActionListener(e -> startDecrypt());
             cancelBtn.addActionListener(e -> {
-                if (task != null) {
-                    CANCELLED.set(true);
+                if (task != null && !task.isDone()) {
+                    cancelled.set(true);
                     cancelBtn.setEnabled(false);
-                    log("Cancel requested...");
+                    appendLog(Lang.t("cancelTitle") + " - " + Lang.t("cancel") + "…");
                 }
             });
 
-            pack();
-            setLocationRelativeTo(null);
-            setMinimumSize(new Dimension(780, 480));
+            applyLanguage();
         }
 
-        void addRow(JPanel form, GridBagConstraints c, int y, String label,
-                    JTextField field, String browseText) {
+        void addRow(JPanel form, GridBagConstraints c, int y, JLabel label,
+                    JTextField field, JButton browseBtn, boolean dirsOnly) {
             c.gridx = 0;
             c.gridy = y + 1;
-            form.add(new JLabel(label), c);
+            form.add(label, c);
             c.gridx = 1;
             c.fill = GridBagConstraints.HORIZONTAL;
             c.weightx = 1.0;
             form.add(field, c);
             c.weightx = 0;
-            if (!browseText.isEmpty()) {
-                JButton b = new JButton("Browse");
-                b.addActionListener(e -> {
+            if (browseBtn != null) {
+                browseBtn.addActionListener(e -> {
                     JFileChooser fc = new JFileChooser();
-                    if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+                    if (dirsOnly) fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+                    if (fc.showOpenDialog(TaskPanel.this) == JFileChooser.APPROVE_OPTION) {
                         field.setText(fc.getSelectedFile().getAbsolutePath());
                     }
                 });
-                form.add(b, c);
+                form.add(browseBtn, c);
             }
             c.fill = GridBagConstraints.NONE;
         }
@@ -867,21 +1118,47 @@ public class DecryptCTRNandGUI {
             o.showKeys = showKeysBox.isSelected();
 
             logArea.setText("");
-            CANCELLED.set(false);
+            cancelled.set(false);
+            running = true;
             startBtn.setEnabled(false);
             cancelBtn.setEnabled(true);
             progress.setVisible(true);
-            progress.setString("Working...");
+            progress.setString(Lang.t("working"));
 
             task = new DecryptTask(o);
             task.execute();
         }
 
-        void log(String line) {
+        void appendLog(String line) {
             SwingUtilities.invokeLater(() -> {
                 logArea.append(line + "\n");
                 logArea.setCaretPosition(logArea.getDocument().getLength());
             });
+        }
+
+        void applyLanguage() {
+            labNand.setText(Lang.t("nand"));
+            labBoot9.setText(Lang.t("boot9"));
+            labOtp.setText(Lang.t("otp"));
+            labCidHex.setText(Lang.t("cidHex"));
+            labCidFile.setText(Lang.t("cidFile"));
+            labOutdir.setText(Lang.t("outdir"));
+            labMode.setText(Lang.t("mode"));
+            otpDecBox.setText(Lang.t("otpDec"));
+            forceBox.setText(Lang.t("force"));
+            showKeysBox.setText(Lang.t("showKeys"));
+            startBtn.setText(Lang.t("start"));
+            cancelBtn.setText(Lang.t("cancel"));
+            for (JButton b : new JButton[]{bNand, bBoot9, bOtp, bCid, bOutdir}) {
+                b.setText(Lang.t("browse"));
+            }
+            for (JTextField f : new JTextField[]{nandField, boot9Field, otpField,
+                    cidFileField, outdirField}) {
+                f.setToolTipText(Lang.t("dropHint"));
+            }
+            if (running) {
+                progress.setString(Lang.t("working"));
+            }
         }
 
         class DecryptTask extends SwingWorker<Void, String> {
@@ -892,38 +1169,41 @@ public class DecryptCTRNandGUI {
             }
 
             protected Void doInBackground() throws Exception {
-                CURRENT_LOG = new Log() {
+                final Log taskLog = new Log() {
                     public void log(String line) {
                         DecryptTask.this.publish(line);
                     }
                 };
+                CURRENT_LOG.set(taskLog);
                 try {
-                    runPipeline(o, true);
+                    runPipeline(o, true, cancelled);
                 } finally {
-                    CURRENT_LOG = CLI_LOG;
+                    CURRENT_LOG.remove();
                 }
                 return null;
             }
 
             protected void process(List<String> chunks) {
-                for (String s : chunks) log(s);
+                for (String s : chunks) appendLog(s);
             }
 
             protected void done() {
+                running = false;
                 startBtn.setEnabled(true);
                 cancelBtn.setEnabled(false);
                 progress.setVisible(false);
+                progress.setString("");
                 try {
                     get();
-                    log("=== SUCCESS ===");
-                    log("All selected partitions decrypted and verified.");
+                    appendLog(Lang.t("successTitle"));
+                    appendLog(Lang.t("successBody"));
                 } catch (InterruptedException e) {
-                    log("=== CANCELLED ===");
+                    appendLog(Lang.t("cancelTitle"));
                 } catch (ExecutionException e) {
                     Throwable t = e.getCause() != null ? e.getCause() : e;
-                    log("=== ERROR ===");
-                    log(t.getMessage());
-                    log("Decryption aborted; no incomplete partition files were left behind.");
+                    appendLog(Lang.t("errorTitle"));
+                    appendLog(t.getMessage() != null ? t.getMessage() : t.toString());
+                    appendLog(Lang.t("abortNote"));
                 }
             }
         }
