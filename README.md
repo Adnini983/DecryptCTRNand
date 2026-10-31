@@ -10,7 +10,7 @@
 
 主交付形态：
 
-- **主交付 = Windows 原生 BAT + PowerShell**（`DecryptCTRNand.bat` + `DecryptCTRNand.ps1`）：仅用 .NET Framework 内置 Aes / SHA256 / BigInteger，零外部依赖、无需 Python / pip / OpenSSL。
+- **主交付 = Windows 原生 PowerShell**（`DecryptCTRNand.ps1`）：仅用 .NET Framework 内置 Aes / SHA256 / BigInteger，零外部依赖、无需 Python / pip / OpenSSL。
 - **Python 参考实现**（`DecryptCTRNand.py`）：与主交付逐字节等价的交叉验证实现，仅需 `pycryptodome`。
 - **Java 11 GUI**（`java/DecryptCTRNandGUI.java` → 本地构建 `java\DecryptCTRNandGUI.jar`）：纯 JDK（Swing + javax.crypto + BigInteger），零外部依赖；**双击 `.jar` 即 GUI**，同一 jar 也支持与 PS1 参数完全一致的 CLI 无头模式。
 
@@ -28,22 +28,21 @@
 启动方式（三端参数名完全一致，大小写不敏感）：
 
 ```cmd
-REM 方式一：BAT 启动器（主交付，推荐）
-DecryptCTRNand.bat -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
-
-REM 方式二：PowerShell 直接调用
+REM 方式一：PowerShell（主交付，推荐）
 .\DecryptCTRNand.ps1 -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 
-REM 方式三：Python 参考实现
+REM 方式二：Python 参考实现
 python DecryptCTRNand.py -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 
-REM 方式四：Java 11 GUI / CLI（jar 双击即用）
+REM 方式三：Java 11 GUI / CLI（jar 双击即用）
 DecryptCTRNandGUI.jar                    REM 双击 .jar：直接打开 Swing GUI（无需任何启动器）
 java -jar DecryptCTRNandGUI.jar          REM 同上（命令行方式）
 java -jar DecryptCTRNandGUI.jar -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 ```
 
-命令行参数（PS1 / BAT、Python、Java CLI 三端统一）：
+> 说明：早期曾提供 `DecryptCTRNand.bat` 启动器（仅转发参数给 PS1），因无额外价值已移除；Windows 用户直接调用 `DecryptCTRNand.ps1` 即可（或右键 → 使用 PowerShell 运行）。
+
+命令行参数（PowerShell、Python、Java CLI 三端统一）：
 
 | 参数 | 说明 |
 |------|------|
