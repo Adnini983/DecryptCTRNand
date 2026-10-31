@@ -1073,6 +1073,9 @@ public class DecryptCTRNandGUI {
             java.util.Map<String, String> zh = new java.util.HashMap<>();
             zh.put("title", "DecryptCTRNand 2.0 - 3DS NAND 解密工具（纯 JDK 11）");
             zh.put("newTask", "＋ 新建任务");
+            zh.put("batch", "批量解密");
+            zh.put("batchStart", "批量解密：已启动 %d 个任务");
+            zh.put("batchNone", "批量解密：没有可启动的任务（均未配置或已在运行）");
             zh.put("closeTab", "×");
             zh.put("language", "语言:");
             zh.put("nand", "NAND dump:");
@@ -1101,6 +1104,9 @@ public class DecryptCTRNandGUI {
             java.util.Map<String, String> en = new java.util.HashMap<>();
             en.put("title", "DecryptCTRNand 2.0 - 3DS NAND Decryptor (Pure JDK 11)");
             en.put("newTask", "+ New Task");
+            en.put("batch", "Batch Decrypt");
+            en.put("batchStart", "Batch decryption: started %d task(s)");
+            en.put("batchNone", "Batch: nothing to start (unconfigured or already running)");
             en.put("closeTab", "×");
             en.put("language", "Language:");
             en.put("nand", "NAND dump:");
@@ -1204,8 +1210,23 @@ public class DecryptCTRNandGUI {
             tabs.setSelectedIndex(idx);
         }
 
-        void closeTab(int idx) {
-            if (idx < 0 || idx >= tabs.getTabCount()) return;
+        /** Start decryption on every configured, not-yet-running task tab. */
+        void batchDecrypt() {
+            int started = 0;
+            for (int i = 0; i < tabs.getTabCount(); i++) {
+                TaskPanel p = (TaskPanel) tabs.getComponentAt(i);
+                if (p.running) continue;                       // already in flight
+                if (p.nandField.getText().trim().isEmpty()) continue; // unconfigured tab
+                p.startDecrypt();
+                started++;
+            }
+            TaskPanel active = (TaskPanel) tabs.getSelectedComponent();
+            active.appendLog(started > 0
+                    ? String.format(Lang.t("batchStart"), started)
+                    : Lang.t("batchNone"));
+        }
+
+        void closeTab(int idx) {            if (idx < 0 || idx >= tabs.getTabCount()) return;
             TaskPanel p = (TaskPanel) tabs.getComponentAt(idx);
             if (p.task != null && !p.task.isDone()) {
                 p.cancelled.set(true); // cancel in-flight work, then close the tab
@@ -1270,6 +1291,7 @@ public class DecryptCTRNandGUI {
         final JProgressBar progress = new JProgressBar(0, 100);
         final JTextArea logArea = new JTextArea();
         final JButton startBtn = new JButton();
+        final JButton batchBtn = new JButton();
         final JButton cancelBtn = new JButton();
         final JLabel labNand = new JLabel();
         final JLabel labBoot9 = new JLabel();
@@ -1282,8 +1304,10 @@ public class DecryptCTRNandGUI {
                 new java.util.concurrent.atomic.AtomicBoolean(false);
         boolean running;
         DecryptTask task;
+        final MainFrame owner;
 
         TaskPanel(MainFrame owner) {
+            this.owner = owner;
             setLayout(new BorderLayout());
 
             JPanel form = new JPanel(new GridBagLayout());
@@ -1323,7 +1347,9 @@ public class DecryptCTRNandGUI {
             south.add(progress, BorderLayout.NORTH);
             JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 12, 6));
             buttons.add(startBtn);
+            buttons.add(batchBtn);
             buttons.add(cancelBtn);
+            batchBtn.addActionListener(e -> owner.batchDecrypt());
             cancelBtn.setEnabled(false);
             south.add(buttons, BorderLayout.CENTER);
             add(south, BorderLayout.SOUTH);
@@ -1361,6 +1387,7 @@ public class DecryptCTRNandGUI {
         }
 
         void startDecrypt() {
+            if (running) return; // guard: no double start (also used by batch)
             Options o = new Options();
             o.nand = nandField.getText().trim();
             o.boot9 = boot9Field.getText().trim();
@@ -1404,6 +1431,7 @@ public class DecryptCTRNandGUI {
             forceBox.setText(Lang.t("force"));
             showKeysBox.setText(Lang.t("showKeys"));
             startBtn.setText(Lang.t("start"));
+            batchBtn.setText(Lang.t("batch"));
             cancelBtn.setText(Lang.t("cancel"));
             for (JTextField f : new JTextField[]{nandField, boot9Field, otpField,
                     cidFileField, outdirField}) {
