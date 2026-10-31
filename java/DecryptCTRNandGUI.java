@@ -5,9 +5,11 @@
  *        DecryptCTRNand.ps1 / DecryptCTRNand.py (see tests/).
  *
  * Pure JDK only: javax.swing + javax.crypto + java.util.BigInteger.
- * Runs either as a Swing GUI (double-click / java -jar) or headless CLI:
- *     java -jar DecryptCTRNandGUI.jar --cli --nand ... --boot9 ... --otp ... \
- *          --cid-file ... --mode dev --outdir out --force
+ * Runs either as a Swing GUI (double-click the jar / java -jar, no launcher
+ * needed) or headless CLI with PS1-identical parameters:
+ *     java -jar DecryptCTRNandGUI.jar -NandFile sysnand.bin -Boot9File boot9.bin \
+ *          -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out -Force
+ *     (a leading --cli is also accepted; legacy --nand-style aliases too)
  *
  * Build (JDK >= 11; target 11 bytecode):
  *     javac --release 11 -d out/classes DecryptCTRNandGUI.java
@@ -35,6 +37,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 
 public class DecryptCTRNandGUI {
@@ -578,7 +581,7 @@ public class DecryptCTRNandGUI {
                 log("    slot 0x" + String.format("%02X", slot) + ": " + toHex(normalKeys.get(slot)));
             }
         } else {
-            log("[+] Derived normalKeys (slots 0x04-0x07): OK (hidden; use --show-keys to display)");
+            log("[+] Derived normalKeys (slots 0x04-0x07): OK (hidden; use -ShowKeys to display)");
         }
 
         // 5. nonce
@@ -624,33 +627,97 @@ public class DecryptCTRNandGUI {
     }
 
     // ---------------- CLI ----------------
+    static void printCliHelp() {
+        System.out.println("DecryptCTRNand v0.2 (Java) - 3DS NAND Dump Decryptor CLI");
+        System.out.println();
+        System.out.println("Usage:");
+        System.out.println("  java -jar DecryptCTRNandGUI.jar -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem>");
+        System.out.println("                        [-CidHex <32hex> | -CidFile <nand_cid.mem>]");
+        System.out.println("                        [-OutDir <dir>] [-Mode dev|retail] [-Force] [-ShowKeys] [-OtpDecrypted]");
+        System.out.println("  (the optional --cli prefix is also accepted; double-clicking the jar opens the GUI)");
+        System.out.println();
+        System.out.println("Parameters (identical to DecryptCTRNand.ps1, case-insensitive):");
+        System.out.println("  -NandFile      NAND dump file path (required)");
+        System.out.println("  -Boot9File     Plaintext boot9.bin path, 64KB or 32KB (required)");
+        System.out.println("  -OtpFile       OTP file path (required; encrypted or decrypted)");
+        System.out.println("  -OtpDecrypted  OTP is already decrypted plaintext (still validated)");
+        System.out.println("  -CidHex        eMMC CID as 32-char hex string");
+        System.out.println("  -CidFile       Path to nand_cid.mem (16 bytes)");
+        System.out.println("  -OutDir        Output directory for decrypted partitions");
+        System.out.println("  -Mode          dev (default) or retail");
+        System.out.println("  -Force         Overwrite existing output files (default: refuse)");
+        System.out.println("  -ShowKeys      Display derived normalKeys (hidden by default)");
+        System.out.println();
+        System.out.println("Legacy aliases still accepted: --nand --boot9 --otp --cid --cid-file");
+        System.out.println("--outdir --mode --otp-dec --force --show-keys.");
+    }
+
+    static String stripDashes(String s) {
+        int i = 0;
+        while (i < s.length() && s.charAt(i) == '-') i++;
+        return s.substring(i).toLowerCase(Locale.ROOT);
+    }
+
+    /** A non-empty first argument that is a known option selects CLI mode; otherwise GUI. */
+    static boolean isCliInvocation(String[] args) {
+        if (args.length == 0) return false;
+        if ("--cli".equalsIgnoreCase(args[0])) return true;
+        if (!args[0].startsWith("-")) return false;
+        switch (stripDashes(args[0])) {
+            case "nandfile": case "nand":
+            case "boot9file": case "boot9":
+            case "otpfile": case "otp":
+            case "cidhex": case "cid":
+            case "cidfile": case "cid-file":
+            case "outdir": case "out-dir":
+            case "mode":
+            case "otpdecrypted": case "otp-dec":
+            case "force":
+            case "showkeys": case "show-keys":
+            case "help": case "h": case "?":
+                return true;
+            default:
+                return false;
+        }
+    }
+
     static void runCli(String[] args) {
         Options o = new Options();
         o.mode = "dev";
-        for (int i = 0; i < args.length; i++) {
+        int i = 0;
+        if (args.length > 0 && "--cli".equalsIgnoreCase(args[0])) i = 1;
+        for (; i < args.length; i++) {
             String a = args[i];
-            switch (a) {
-                case "--nand": o.nand = args[++i]; break;
-                case "--boot9": o.boot9 = args[++i]; break;
-                case "--otp": o.otp = args[++i]; break;
-                case "--cid": o.cidHex = args[++i]; break;
-                case "--cid-file": o.cidFile = args[++i]; break;
-                case "--outdir": o.outdir = args[++i]; break;
-                case "--mode":
-                    String m = args[++i];
-                    if (!"dev".equals(m) && !"retail".equals(m)) {
-                        System.err.println("[!] --mode must be dev or retail");
+            switch (stripDashes(a)) {
+                case "nandfile": case "nand": o.nand = needValue(args, i, a); i++; break;
+                case "boot9file": case "boot9": o.boot9 = needValue(args, i, a); i++; break;
+                case "otpfile": case "otp": o.otp = needValue(args, i, a); i++; break;
+                case "cidhex": case "cid": o.cidHex = needValue(args, i, a); i++; break;
+                case "cidfile": case "cid-file": o.cidFile = needValue(args, i, a); i++; break;
+                case "outdir": case "out-dir": o.outdir = needValue(args, i, a); i++; break;
+                case "mode":
+                    o.mode = needValue(args, i, a).toLowerCase(Locale.ROOT);
+                    if (!"dev".equals(o.mode) && !"retail".equals(o.mode)) {
+                        System.err.println("[!] -Mode must be dev or retail");
                         System.exit(1);
                     }
-                    o.mode = m;
+                    i++;
                     break;
-                case "--otp-dec": o.otpDec = true; break;
-                case "--force": o.force = true; break;
-                case "--show-keys": o.showKeys = true; break;
+                case "otpdecrypted": case "otp-dec": o.otpDec = true; break;
+                case "force": o.force = true; break;
+                case "showkeys": case "show-keys": o.showKeys = true; break;
+                case "help": case "h": case "?":
+                    printCliHelp();
+                    System.exit(0);
+                    break;
                 default:
                     System.err.println("[!] unknown argument: " + a);
                     System.exit(1);
             }
+        }
+        if (o.nand == null || o.boot9 == null || o.otp == null) {
+            System.err.println("[!] -NandFile / -Boot9File / -OtpFile are required (see --help)");
+            System.exit(1);
         }
         try {
             runPipeline(o, false);
@@ -661,10 +728,18 @@ public class DecryptCTRNandGUI {
         }
     }
 
+    static String needValue(String[] args, int i, String opt) {
+        if (i + 1 >= args.length) {
+            System.err.println("[!] " + opt + " requires a value");
+            System.exit(1);
+        }
+        return args[i + 1];
+    }
+
     // ---------------- GUI ----------------
     public static void main(String[] args) {
-        if (args.length > 0 && "--cli".equals(args[0])) {
-            runCli(Arrays.copyOfRange(args, 1, args.length));
+        if (isCliInvocation(args)) {
+            runCli(args);
             return;
         }
         SwingUtilities.invokeLater(new Runnable() {

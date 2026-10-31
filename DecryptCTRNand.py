@@ -19,11 +19,13 @@ v0.2 fixes (kept in sync with DecryptCTRNand.ps1):
   * Overwrite protection (--force required to overwrite).
   * CID / normalKeys hidden by default; use --show-keys to display.
 
-Usage:
-    python DecryptCTRNand.py --nand sysnand.bin --boot9 boot9.bin --otp otp.mem \
-        --cid-file nand_cid.mem --mode dev --outdir out/
-    python DecryptCTRNand.py --nand sysnand.bin --boot9 boot9.bin --otp otp_dec.mem \
-        --otp-dec --cid-hex 8FA3544A... --mode retail --outdir out/
+Usage (parameters identical to DecryptCTRNand.ps1, case-insensitive):
+    python DecryptCTRNand.py -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem \
+        -CidFile nand_cid.mem -Mode dev -OutDir out/
+    python DecryptCTRNand.py -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp_dec.mem \
+        -OtpDecrypted -CidHex 8FA3544A... -Mode retail -OutDir out/ -Force -ShowKeys
+    Legacy aliases still accepted: --nand --boot9 --otp --cid --cid-file --outdir
+    --mode --otp-dec --force --show-keys.
 """
 
 import argparse
@@ -339,7 +341,7 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
 
     if os.path.exists(out_file):
         if not force:
-            raise FileExistsError(f"Output already exists: {out_file}. Re-run with --force to overwrite.")
+            raise FileExistsError(f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
         os.remove(out_file)
     if os.path.exists(tmp_file):
         os.remove(tmp_file)
@@ -401,19 +403,88 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
             os.remove(tmp_file)
 
 
+def print_help():
+    print("""decrypt3dsnand v0.2 - 3DS NAND Dump Decryptor (Pure Python, pycryptodome)
+
+Usage:
+  python DecryptCTRNand.py -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem>
+                           [-CidHex <32hex> | -CidFile <nand_cid.mem>]
+                           [-OutDir <dir>] [-Mode dev|retail] [-Force] [-ShowKeys]
+                           [-OtpDecrypted]
+
+Parameters (identical to DecryptCTRNand.ps1, case-insensitive):
+  -NandFile      NAND dump file path (required)
+  -Boot9File     Plaintext boot9.bin path, 64KB or 32KB (required)
+  -OtpFile       OTP file path (required; encrypted or decrypted)
+  -OtpDecrypted  OTP is already decrypted plaintext (still validated)
+  -CidHex        eMMC CID as 32-char hex string
+  -CidFile       Path to nand_cid.mem (16 bytes)
+  -OutDir        Output directory for decrypted partitions
+  -Mode          dev (default) or retail
+  -Force         Overwrite existing output files (default: refuse)
+  -ShowKeys      Display derived normalKeys (hidden by default)
+
+Legacy aliases still accepted: --nand --boot9 --otp --cid --cid-file --outdir
+--mode --otp-dec --force --show-keys.""")
+
+
+def parse_args(argv):
+    """Case-insensitive PS1-style CLI parser (keeps legacy --name aliases)."""
+    o = argparse.Namespace()
+    o.nand = None
+    o.boot9 = None
+    o.otp = None
+    o.otp_dec = False
+    o.cid = None
+    o.cid_file = None
+    o.outdir = None
+    o.mode = "dev"
+    o.force = False
+    o.show_keys = False
+
+    aliases = {
+        "nandfile": ("nand", False), "nand": ("nand", False),
+        "boot9file": ("boot9", False), "boot9": ("boot9", False),
+        "otpfile": ("otp", False), "otp": ("otp", False),
+        "cidhex": ("cid", False), "cid": ("cid", False),
+        "cidfile": ("cid_file", False), "cid-file": ("cid_file", False),
+        "outdir": ("outdir", False), "out-dir": ("outdir", False),
+        "mode": ("mode", False),
+        "otpdecrypted": ("otp_dec", True), "otp-dec": ("otp_dec", True),
+        "force": ("force", True),
+        "showkeys": ("show_keys", True), "show-keys": ("show_keys", True),
+        "help": ("help", True),
+    }
+
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-h", "--help", "/?"):
+            print_help()
+            sys.exit(0)
+        if not tok.startswith("-"):
+            sys.exit(f"[!] unexpected argument: {tok}")
+        key = tok.lstrip("-").lower()
+        if key not in aliases:
+            sys.exit(f"[!] unknown argument: {tok} (see --help)")
+        attr, is_flag = aliases[key]
+        if is_flag:
+            setattr(o, attr, True)
+            i += 1
+        else:
+            if i + 1 >= len(argv):
+                sys.exit(f"[!] {tok} requires a value")
+            setattr(o, attr, argv[i + 1])
+            i += 2
+    return o
+
+
 def main():
-    parser = argparse.ArgumentParser(description="3DS NAND Dump Decryptor v0.2")
-    parser.add_argument("--nand", required=True, help="NAND dump file path")
-    parser.add_argument("--boot9", required=True, help="Plaintext boot9.bin path (64KB or 32KB)")
-    parser.add_argument("--otp", required=True, help="OTP file path (encrypted or decrypted)")
-    parser.add_argument("--otp-dec", action="store_true", help="OTP is already decrypted plaintext")
-    parser.add_argument("--cid", help="eMMC CID as 32-char hex string")
-    parser.add_argument("--cid-file", help="Path to nand_cid.mem (16 bytes)")
-    parser.add_argument("--outdir", help="Output directory for decrypted partitions")
-    parser.add_argument("--mode", choices=["dev", "retail"], default="dev", help="Console key mode")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing output files")
-    parser.add_argument("--show-keys", action="store_true", help="Display derived normalKeys (hidden by default)")
-    args = parser.parse_args()
+    args = parse_args(sys.argv[1:])
+    if args.mode not in ("dev", "retail"):
+        sys.exit(f"[!] -Mode must be dev or retail, got '{args.mode}'")
+    if args.nand is None or args.boot9 is None or args.otp is None:
+        sys.exit("[!] -NandFile / -Boot9File / -OtpFile are required (see --help)")
 
     print("=== decrypt3dsnand v0.2 ===")
     print(f"NAND: {args.nand}")
@@ -460,7 +531,7 @@ def main():
         for slot in sorted(normal_keys.keys()):
             print(f"    slot 0x{slot:02X}: {normal_keys[slot].hex().upper()}")
     else:
-        print(f"\n[+] Derived normalKeys (slots 0x04-0x07): OK (hidden; use --show-keys to display)")
+        print(f"\n[+] Derived normalKeys (slots 0x04-0x07): OK (hidden; use -ShowKeys to display)")
 
     # Step 5: nonce
     nonce = derive_nonce(cid)
@@ -479,7 +550,7 @@ def main():
                 continue
             decrypt_partition(args.nand, part, normal_keys[part["slot"]], nonce, args.outdir, args.force)
     else:
-        print("\n[*] No --outdir specified: keys derived, partitions not written to disk.")
+        print("\n[*] No -OutDir specified: keys derived, partitions not written to disk.")
 
     # Summary
     print("\n=== Summary ===")
@@ -492,7 +563,7 @@ def main():
         print(f"Partitions: decrypted to {args.outdir} (structural checks applied)")
         print("Note: AES-CTR provides no integrity authentication; checks are structural sanity checks only.")
     else:
-        print("Partitions: not decrypted (no --outdir)")
+        print("Partitions: not decrypted (no -OutDir)")
     print("\nDone.")
 
 

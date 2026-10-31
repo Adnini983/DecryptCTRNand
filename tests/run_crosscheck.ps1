@@ -51,16 +51,19 @@ function Invoke-Impl([string]$impl, [string]$mode, [string]$outDir, [string]$ext
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
     Write-Host "--- $impl / $mode $extraArgs ---"
+    # All three implementations use the PS1-identical parameter names
+    # (case-insensitive). The Java jar is invoked WITHOUT the --cli prefix to
+    # prove the CLI entry works directly from the double-clickable jar.
     switch ($impl) {
         "ps1" {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "DecryptCTRNand.ps1") `
                 -NandFile $nand -Boot9File $boot9 -OtpFile $otp -CidFile $cid -Mode $mode -OutDir $outDir -Force
         }
         "py" {
-            & python (Join-Path $root "DecryptCTRNand.py") --nand $nand --boot9 $boot9 --otp $otp --cid-file $cid --mode $mode --outdir $outDir --force
+            & python (Join-Path $root "DecryptCTRNand.py") -NandFile $nand -Boot9File $boot9 -OtpFile $otp -CidFile $cid -Mode $mode -OutDir $outDir -Force
         }
         "java" {
-            & java -jar $JavaJar --cli --nand $nand --boot9 $boot9 --otp $otp --cid-file $cid --mode $mode --outdir $outDir --force
+            & java -jar $JavaJar -NandFile $nand -Boot9File $boot9 -OtpFile $otp -CidFile $cid -Mode $mode -OutDir $outDir -Force
         }
     }
     if ($LASTEXITCODE -ne 0) {
@@ -133,7 +136,7 @@ $otpPlainD = Join-Path $vec "otp_plain_dev.bin"
 $outOtp = Join-Path $outRoot "py_dec_dev"
 if (Test-Path -LiteralPath $outOtp) { Remove-Item -Recurse -Force -LiteralPath $outOtp }
 New-Item -ItemType Directory -Force -Path $outOtp | Out-Null
-& python (Join-Path $root "DecryptCTRNand.py") --nand $nandD --boot9 $boot9V --otp $otpPlainD --otp-dec --cid-file $cidV --mode dev --outdir $outOtp --force
+& python (Join-Path $root "DecryptCTRNand.py") -NandFile $nandD -Boot9File $boot9V -OtpFile $otpPlainD -OtpDecrypted -CidFile $cidV -Mode dev -OutDir $outOtp -Force
 if ($LASTEXITCODE -ne 0) { $failures += "py/otp-dec dev failed"; Write-Host "[FAIL] otp-dec run failed" -ForegroundColor Red }
 else {
     $ok = $true
@@ -166,7 +169,7 @@ if ($LASTEXITCODE -eq 0) { $negFail++; Write-Host "[FAIL] overwrite protection: 
 else { Write-Host "[PASS] overwrite protection (no -Force refuses to overwrite)" -ForegroundColor Green }
 
 # 5.2 wrong mode: retail mode with dev OTP must fail (dev flag consistency)
-& python (Join-Path $root "DecryptCTRNand.py") --nand $nandD --boot9 $boot9V --otp (Join-Path $vec "otp_dev.bin") --cid-file $cidV --mode retail --outdir $outNeg1 2> $negLog | Out-Null
+& python (Join-Path $root "DecryptCTRNand.py") -NandFile $nandD -Boot9File $boot9V -OtpFile (Join-Path $vec "otp_dev.bin") -CidFile $cidV -Mode retail -OutDir $outNeg1 2> $negLog | Out-Null
 if ($LASTEXITCODE -eq 0) { $negFail++; Write-Host "[FAIL] dev-flag consistency: retail mode + dev OTP should have failed" -ForegroundColor Red }
 else { Write-Host "[PASS] dev-flag consistency (retail mode rejects dev OTP)" -ForegroundColor Green }
 
@@ -175,12 +178,12 @@ $truncNand = Join-Path $vec "nand_truncated.bin"
 $fullBytes = [System.IO.File]::ReadAllBytes($nandD)
 $half = [Math]::Max(0x400, [int]($fullBytes.Length / 2))
 [System.IO.File]::WriteAllBytes($truncNand, $fullBytes[0..($half - 1)])
-& python (Join-Path $root "DecryptCTRNand.py") --nand $truncNand --boot9 $boot9V --otp (Join-Path $vec "otp_dev.bin") --cid-file $cidV --mode dev --outdir $outNeg1 2> $negLog | Out-Null
+& python (Join-Path $root "DecryptCTRNand.py") -NandFile $truncNand -Boot9File $boot9V -OtpFile (Join-Path $vec "otp_dev.bin") -CidFile $cidV -Mode dev -OutDir $outNeg1 2> $negLog | Out-Null
 if ($LASTEXITCODE -eq 0) { $negFail++; Write-Host "[FAIL] truncated NAND should have failed" -ForegroundColor Red }
 else { Write-Host "[PASS] truncated NAND rejected" -ForegroundColor Green }
 
 # 5.4 bad CID hex must fail
-& python (Join-Path $root "DecryptCTRNand.py") --nand $nandD --boot9 $boot9V --otp (Join-Path $vec "otp_dev.bin") --cid "1234" --mode dev --outdir $outNeg1 2> $negLog | Out-Null
+& python (Join-Path $root "DecryptCTRNand.py") -NandFile $nandD -Boot9File $boot9V -OtpFile (Join-Path $vec "otp_dev.bin") -CidHex "1234" -Mode dev -OutDir $outNeg1 2> $negLog | Out-Null
 if ($LASTEXITCODE -eq 0) { $negFail++; Write-Host "[FAIL] bad CID hex should have failed" -ForegroundColor Red }
 else { Write-Host "[PASS] bad CID hex rejected" -ForegroundColor Green }
 

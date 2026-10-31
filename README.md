@@ -19,7 +19,7 @@
 
 - **主交付 = Windows 原生 BAT + PowerShell**（`DecryptCTRNand.bat` + `DecryptCTRNand.ps1`）：仅用 .NET Framework 内置 Aes / SHA256 / BigInteger，零外部依赖、无需 Python / pip / OpenSSL。
 - **Python 参考实现**（`DecryptCTRNand.py`）：与主交付逐字节等价的交叉验证实现（v0.2 起已具备完整分区解密能力），仅需 `pycryptodome`。
-- **Java 11 GUI**（`java/DecryptCTRNandGUI.jar` + 启动器）：纯 JDK（Swing + javax.crypto + BigInteger），**零外部依赖，只要有 JRE/JDK 11+ 即可双击使用**；同一 jar 也支持 `--cli` 无头模式。
+- **Java 11 GUI**（`java/DecryptCTRNandGUI.jar`）：纯 JDK（Swing + javax.crypto + BigInteger），**零外部依赖，只要有 JRE/JDK 11+ 即可使用**。**直接双击 `.jar` 即可打开 GUI，不需要任何启动器**；同一 jar 也支持与 PS1 参数完全一致的 `--cli` 无头模式。
 
 ## 运行环境要求
 
@@ -57,8 +57,8 @@
 | 直接打印 normalKey / CID | 默认隐藏；`-ShowKeys` 才显示；日志不落盘 |
 | README 声称的 MBR/FIRM 校验未实现 | v0.2 已真正实现（MBR 55AA @ 分区内 +0x1FE；FIRM magic @ +0x100）。**CTR 卷标断言取消**（从未实现，AES-CTR 无认证，保留结构合理性检查） |
 | 输出被静默覆盖 | 默认拒绝覆盖，`-Force` 显式授权；`.tmp` 写入 → 校验 → 原子 rename 提交；finally 清理 |
-| Python 未实现分区解密 | 已实现完整分区解密/结构校验/`--force`/`--show-keys`/每分区 SHA-256 |
-| Python retail keyinit 硬编码 dev | `keyinit(otp_plain, boot9, dev)` 由 `--mode` 传入，零售 keyblob 偏移正确 |
+| Python 未实现分区解密 | 已实现完整分区解密/结构校验/`-Force`/`-ShowKeys`/每分区 SHA-256 |
+| Python retail keyinit 硬编码 dev | `keyinit(otp_plain, boot9, dev)` 由 `-Mode` 传入，零售 keyblob 偏移正确 |
 | Python 缺明文 OTP 校验 | 与 PS1 相同的统一 `validate_otp` |
 | 独立测试向量 | `tests/`：合成 boot9/OTP/CID/NCSD 向量 + 三端（PS1/Python/Java）逐字节交叉验证 + 负向用例（见「测试」） |
 
@@ -79,34 +79,37 @@ DecryptCTRNand.bat -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -
 ### 方式三：Python 参考实现
 
 ```powershell
-python DecryptCTRNand.py --nand sysnand.bin --boot9 boot9.bin --otp otp.mem --cid-file nand_cid.mem --mode dev --outdir out
+python DecryptCTRNand.py -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 ```
 
 ### 方式四：Java 11 GUI / CLI
 
 ```cmd
-DecryptCTRNandGUI.bat                    REM 双击 / 运行：打开 Swing GUI
-DecryptCTRNandGUI.bat --cli --nand sysnand.bin --boot9 boot9.bin --otp otp.mem --cid-file nand_cid.mem --mode dev --outdir out
+DecryptCTRNandGUI.jar                    REM 双击 .jar：直接打开 Swing GUI（无需 bat）
+java -jar DecryptCTRNandGUI.jar          REM 同上（命令行方式）
+java -jar DecryptCTRNandGUI.jar -NandFile sysnand.bin -Boot9File boot9.bin -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out
 ```
 
-GUI 里选择文件、勾选选项后点「Start Decryption」即可；后台线程解密，进度条 + 日志区实时显示，可取消。
+- **双击 jar 即 GUI**：`Main-Class` 已写入 manifest，双击调用 `javaw` 打开窗口（需系统已关联 .jar 到 JRE/JDK，标准安装默认关联）。无参数运行时自动进入 GUI。
+- **CLI 与 PS1 参数一致**：`java -jar DecryptCTRNandGUI.jar -NandFile ... -Boot9File ...` 直接可用（`-` 前缀、大小写不敏感），可选再带一个 `--cli` 前缀；旧 `--nand` 风格别名也保留。
+- `DecryptCTRNandGUI.bat` 仅是可选的命令行快捷方式，**非必需**。
 
-## 命令行参数
+## 命令行参数（三端统一，与 PS1 完全一致）
 
-三端参数一一对应：
+**PS1 / BAT、Python、Java CLI 三端参数名完全一致**（大小写不敏感）；Java 可直接 `java -jar ... -NandFile ...` 使用，也接受可选 `--cli` 前缀；Python/Java 保留旧 `--nand` 风格别名（见各实现 `--help`）。
 
-| PS1 / BAT | Python / Java CLI | 说明 |
-|------|------|------|
-| `-NandFile` | `--nand` | NAND dump 文件路径（必填） |
-| `-Boot9File` | `--boot9` | 明文 boot9.bin（必填，64KB 或 32KB 均可） |
-| `-OtpFile` | `--otp` | OTP 文件（必填，加密或解密均可） |
-| `-OtpDecrypted` | `--otp-dec` | OTP 已是解密明文（仍会统一校验） |
-| `-CidHex` | `--cid` | eMMC CID，32 个 hex 字符 |
-| `-CidFile` | `--cid-file` | nand_cid.mem（16 字节） |
-| `-OutDir` | `--outdir` | 解密分区输出目录 |
-| `-Mode` | `--mode` | `dev`（默认）或 `retail` |
-| `-Force` | `--force` | 允许覆盖已存在的输出文件（默认拒绝） |
-| `-ShowKeys` | `--show-keys` | 显示派生的 normalKey（默认隐藏） |
+| PS1 / BAT | Python | Java CLI | 说明 |
+|------|------|------|------|
+| `-NandFile` | `-NandFile` | `-NandFile` | NAND dump 文件路径（必填） |
+| `-Boot9File` | `-Boot9File` | `-Boot9File` | 明文 boot9.bin（必填，64KB 或 32KB 均可） |
+| `-OtpFile` | `-OtpFile` | `-OtpFile` | OTP 文件（必填，加密或解密均可） |
+| `-OtpDecrypted` | `-OtpDecrypted` | `-OtpDecrypted` | OTP 已是解密明文（仍会统一校验） |
+| `-CidHex` | `-CidHex` | `-CidHex` | eMMC CID，32 个 hex 字符 |
+| `-CidFile` | `-CidFile` | `-CidFile` | nand_cid.mem（16 字节） |
+| `-OutDir` | `-OutDir` | `-OutDir` | 解密分区输出目录 |
+| `-Mode` | `-Mode` | `-Mode` | `dev`（默认）或 `retail` |
+| `-Force` | `-Force` | `-Force` | 允许覆盖已存在的输出文件（默认拒绝） |
+| `-ShowKeys` | `-ShowKeys` | `-ShowKeys` | 显示派生的 normalKey（默认隐藏） |
 
 ## 输入文件说明
 
@@ -159,6 +162,8 @@ GUI 里选择文件、勾选选项后点「Start Decryption」即可；后台线
 python tests\make_testvectors.py
 
 # 2) 三端交叉验证（PS1 + Python；带上 Java jar 则三端）
+#    对三端的调用统一使用与 PS1 一致的参数名（-NandFile 等）；
+#    Java 不经 --cli 前缀直接调用，验证 jar 的 CLI 入口本身。
 powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1
 powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1 -JavaJar java\DecryptCTRNandGUI.jar
 ```
@@ -171,7 +176,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1 -JavaJar java\
 java\build.bat
 ```
 
-产物：`java\DecryptCTRNandGUI.jar`（`javac --release 11` 编译，Java 11 字节码；Main-Class manifest）。分发时把 `java\DecryptCTRNandGUI.jar` 与根目录 `DecryptCTRNandGUI.bat` 放一起即可。
+产物：`java\DecryptCTRNandGUI.jar`（`javac --release 11` 编译，Java 11 字节码；Main-Class manifest）。**分发时只需这一个 jar**：双击即 GUI、`java -jar ... -NandFile ...` 即 CLI；根目录 `DecryptCTRNandGUI.bat` 只是可选快捷方式。
 
 ## 方案依据
 

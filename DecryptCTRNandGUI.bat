@@ -1,8 +1,11 @@
 @echo off
-rem DecryptCTRNandGUI launcher - requires JRE/JDK 11 or newer (no other dependencies)
-rem   Double-click            -> opens the Swing GUI
-rem   DecryptCTRNandGUI.bat --cli --nand ... --boot9 ... --otp ... [--cid ...] [--cid-file ...]
-rem                             [--mode dev|retail] [--outdir ...] [--force] [--otp-dec] [--show-keys]
+rem DecryptCTRNandGUI - OPTIONAL convenience launcher (the jar itself is standalone)
+rem   The jar is self-contained: double-click java\DecryptCTRNandGUI.jar to open the
+rem   Swing GUI (Main-Class in manifest), or run CLI with PS1-identical parameters:
+rem   java -jar java\DecryptCTRNandGUI.jar -NandFile ... -Boot9File ... -OtpFile ... ...
+rem
+rem   Double-click this bat        -> opens the Swing GUI
+rem   This bat with arguments      -> passes them through to java -jar (CLI mode)
 cd /d "%~dp0"
 if "%~1"=="" (
     start "DecryptCTRNand" javaw -jar "%~dp0java\DecryptCTRNandGUI.jar"
