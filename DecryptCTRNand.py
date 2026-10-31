@@ -386,7 +386,7 @@ def derive_twl_key(otp_enc: bytes, otp_plain: bytes, dev: bool) -> bytes:
         hi = int.from_bytes(otp_plain[0x0C:0x10], byteorder='little')
         lo = (lo ^ 0xB358A6AF) | 0x80000000
         hi = hi ^ 0x08C267B7
-        keyx = struct.pack('<IIII', lo, 0x4E494E54, 0x454E444F, hi)  # "NINT" "ENDO"
+        keyx = struct.pack('<IIII', lo, 0x544E494E, 0x4F444E45, hi)  # "NINT" "ENDO"
         keyy = KEYY_TWL_RETAIL
     return scramble_twl(keyx, keyy)
 

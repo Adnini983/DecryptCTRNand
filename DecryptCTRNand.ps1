@@ -353,8 +353,8 @@ function Get-TwlKey([byte[]]$otpEnc, [byte[]]$otpPlain, [bool]$isDev) {
         $lo = $lo -band [long]4294967295
         $hi = ($hi -bxor [long][Convert]::ToUInt32("08C267B7", 16)) -band [long]4294967295
         [BitConverter]::GetBytes([uint32]$lo).CopyTo($keyx, 0)
-        [BitConverter]::GetBytes([uint32][Convert]::ToUInt32("4E494E54", 16)).CopyTo($keyx, 4)
-        [BitConverter]::GetBytes([uint32][Convert]::ToUInt32("454E444F", 16)).CopyTo($keyx, 8)
+        [BitConverter]::GetBytes([uint32][Convert]::ToUInt32("544E494E", 16)).CopyTo($keyx, 4)
+        [BitConverter]::GetBytes([uint32][Convert]::ToUInt32("4F444E45", 16)).CopyTo($keyx, 8)
         [BitConverter]::GetBytes([uint32]$hi).CopyTo($keyx, 12)
     }
     return [NandCrypto]::ScrambleTwl($keyx, $keyy)

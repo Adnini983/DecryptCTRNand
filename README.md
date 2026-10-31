@@ -12,7 +12,7 @@
 
 ## 版本
 
-- **2.0（当前）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。
+- **2.0（当前）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。**修复：零售 TWL keyX 中间 8 字节 "NINTENDO" 的 LE 打包常量错误**（真机零售 OTP 暴露，dev 分支不受影响）。
 - 1.0（v0.2 加固版）：依据外部代码审计系统性加固正确性/输入验证/输出验证/安全，并新增纯 JDK 11 GUI 实现与合成测试向量三端交叉验证。
 - v0.1：初版（BAT + PowerShell），已在用户实机 dump 上验证（见「验证状态」）。
 
@@ -155,6 +155,8 @@ java -jar DecryptCTRNandGUI.jar -NandFile sysnand.bin -Boot9File boot9.bin -OtpF
 | Old3DS devkit (REFxxxxxxx) | dev | ✅ v0.1 端到端验证通过（OTP 解密、NCSD 5 分区、CTRNAND MBR 55AA、firm0 FIRM magic） |
 | New3DS retail (QJFxxxxxxx) | retail | ✅ v0.1 端到端验证通过（CTRNAND MBR 55AA） |
 | New3DS XL devkit "Louvre" (QW00004551) | dev | ✅ **2.0 全分区端到端验证通过**（TWL 分区：raw OTP 派生、twln FAT16 / twlp FAT12 / MBR 55AA / blk0x1D 锚点 PASS；p2/p3 FIRM magic PASS；p4 CTRNAND MBR 55AA PASS；`otp_dec.mem` 解不出正确 TWL 密钥——实证） |
+| Old3DS devkit "RW10000843" | dev | ✅ **2.0 三端（PS1/Python/Java）全分区 PASS**（TWL raw OTP、MBR/blk0x1D/twln 三锚点 PASS；p2/p3 FIRM magic PASS；p4 CTRNAND MBR 55AA PASS；5 分区 SHA-256 三端逐字节一致） |
+| New3DS LL retail "QJF12337954" | retail | ✅ **2.0 三端（PS1/Python/Java）全分区 PASS**（TWL 三锚点 PASS；p2/p3 FIRM magic PASS；p4 crypt3→slot05 CTRNAND MBR 55AA PASS；5 分区 SHA-256 三端逐字节一致；零售 TWL keyX 字节序修复后复测通过） |
 
 ### 合成向量三端交叉验证（`tests/`，本地保留、不入库）
 

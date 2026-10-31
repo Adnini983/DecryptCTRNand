@@ -231,8 +231,8 @@ public class DecryptCTRNandGUI {
         }
         byte[] keyx = new byte[16];
         putU32LE(keyx, 0, lo);
-        putU32LE(keyx, 4, dev ? 0xEE7A4B1EL : 0x4E494E54L);
-        putU32LE(keyx, 8, dev ? 0xAF42C08BL : 0x454E444FL);
+        putU32LE(keyx, 4, dev ? 0xEE7A4B1EL : 0x544E494EL);
+        putU32LE(keyx, 8, dev ? 0xAF42C08BL : 0x4F444E45L);
         putU32LE(keyx, 12, hi);
         return scrambleTwl(keyx, keyy);
     }
