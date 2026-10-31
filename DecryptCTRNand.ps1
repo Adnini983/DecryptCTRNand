@@ -296,6 +296,35 @@ function ReadExactly($stream, $buffer, $offset, $count) {
     return $total
 }
 
+# Commit-TempFile: atomically publish a fully-verified .tmp file as the final
+# output. The old output file is NEVER deleted in advance - it survives any
+# mid-decrypt failure and is only replaced once the new file has been written
+# and validated. On NTFS, [IO.File]::Replace is atomic; if the filesystem does
+# not support it we fall back to a backup-and-swap that still restores the old
+# file if the swap itself fails.
+function Commit-TempFile([string]$tmpFile, [string]$outFile) {
+    if (Test-Path -LiteralPath $outFile -PathType Leaf) {
+        try {
+            [System.IO.File]::Replace($tmpFile, $outFile, $null)
+        } catch {
+            # Non-atomic fallback: move the old file aside, swap in the new one,
+            # and roll the old file back if the swap fails.
+            $bak = "$outFile.bak"
+            if (Test-Path -LiteralPath $bak -PathType Leaf) { Remove-Item -LiteralPath $bak -Force }
+            [System.IO.File]::Move($outFile, $bak)
+            try {
+                [System.IO.File]::Move($tmpFile, $outFile)
+                Remove-Item -LiteralPath $bak -Force
+            } catch {
+                [System.IO.File]::Move($bak, $outFile)
+                throw
+            }
+        }
+    } else {
+        [System.IO.File]::Move($tmpFile, $outFile)
+    }
+}
+
 # Streaming SHA-256 of a file (1MB chunks), returns hex string.
 function Get-FileSha256([string]$path) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -380,7 +409,8 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
 
     if (Test-Path -LiteralPath $outFile -PathType Leaf) {
         if (-not $Force) { throw "Output already exists: $outFile . Re-run with -Force to overwrite." }
-        Remove-Item -LiteralPath $outFile -Force
+        # -Force: the old file is NOT removed here. It is replaced atomically at
+        # commit time only after the new file passed every check (see Commit-TempFile).
     }
     if (Test-Path -LiteralPath $tmpFile -PathType Leaf) {
         Remove-Item -LiteralPath $tmpFile -Force
@@ -483,6 +513,7 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
         $blk1dOk = ($blk1dHex -eq "8E400601A0C38D800400B30501000000")
 
         $fatSigOk = $true
+        $oemOk = $true
         $oem = ""
         if ($p.Size -gt 0x12E00 + 0x200) {
             # twln FAT boot sector only exists if the TWL region actually covers it
@@ -495,6 +526,7 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
             if ($fr -lt 0x200) { throw "Partition $index : TWL region too small for twln boot check" }
             $fatSigOk = ($fat[0x1FE] -eq 0x55 -and $fat[0x1FF] -eq 0xAA)
             $oem = [System.Text.Encoding]::ASCII.GetString($fat, 0x03, 8)
+            $oemOk = ($oem -eq "TWL     ")   # FAT boot sector OEM label (8 bytes)
         }
 
         $notes = @()
@@ -508,18 +540,18 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
             throw "Partition $index : TWL block 0x1D anchor mismatch (wrong key/OTP?)"
         }
         $notes += "blk0x1D anchor OK"
-        if (-not $fatSigOk) {
+        if (-not $fatSigOk -or -not $oemOk) {
             if (Test-Path -LiteralPath $tmpFile) { Remove-Item -LiteralPath $tmpFile -Force }
-            throw "Partition $index : twln FAT boot 55AA missing (wrong offset?)"
+            throw "Partition $index : twln FAT boot 55AA missing or OEM != 'TWL     ' (got '$oem', wrong offset?)"
         }
         if ($p.Size -gt 0x12E00 + 0x200) {
-            $notes += "twln boot 55AA OK (OEM='$oem')"
+            $notes += "twln boot 55AA + OEM 'TWL     ' OK"
         } else {
             $notes += "twln boot check skipped (partition too small)"
         }
 
         $shaHex = Get-FileSha256 $tmpFile
-        [System.IO.File]::Move($tmpFile, $outFile)
+        Commit-TempFile $tmpFile $outFile
 
         Write-Host "saved ($([Math]::Round($p.Size / 1MB, 1)) MB, wrote $written bytes, $($notes -join ', '))" -ForegroundColor Green
         Write-Host "        SHA-256: $shaHex" -ForegroundColor DarkGray
@@ -664,6 +696,7 @@ try {
     }
 
     $partitions = @()
+    $firmCount = 0
     for ($i = 0; $i -lt 8; $i++) {
         $fstype = $ncsdHeader[0x110 + $i]
         $crypttype = $ncsdHeader[0x118 + $i]
@@ -690,23 +723,30 @@ try {
         }
 
         # --- AES slot mapping (rule-based, refuses unknowns) ---
-        # crypt 0x01 = TWL (slot 0x03, dedicated nonce/key scheme)
-        # crypt 0x02: fs 0x01 = Old3DS CTRNAND -> slot 0x04
-        #             fs 0x03 = FIRM           -> slot 0x06
-        #             fs 0x04 = AGB_FIRM save  -> slot 0x07
-        # crypt 0x03 = New3DS CTRNAND         -> slot 0x05
+        # crypt 0x01: fs 0x01 = TWL             -> slot 0x03 (dedicated nonce/key scheme)
+        # crypt 0x02: fs 0x01 = Old3DS CTRNAND  -> slot 0x04
+        #             fs 0x03 = FIRM            -> slot 0x06
+        #             fs 0x04 = AGB_FIRM save   -> slot 0x07
+        # crypt 0x03: fs 0x01 = New3DS CTRNAND  -> slot 0x05
+        # (pyctr identifies partitions by fs type first, then encryption type;
+        #  unknown fs/crypt combinations are refused, not guessed.)
         $slot = 0
         $status = "decrypt"
         if ($crypttype -eq 1) {
-            $slot = 0x03
-            $status = "twl"   # TWL: dedicated key (raw OTP for dev) + SHA1(CID) nonce + reversed-block CTR
+            if ($fstype -eq 1) {
+                $slot = 0x03
+                $status = "twl"   # TWL: dedicated key (raw OTP for dev) + SHA1(CID) nonce + reversed-block CTR
+            } else {
+                $status = "unknown"
+            }
         } elseif ($crypttype -eq 2) {
             if ($fstype -eq 1) { $slot = 0x04 }
             elseif ($fstype -eq 3) { $slot = 0x06 }
             elseif ($fstype -eq 4) { $slot = 0x07 }
             else { $status = "unknown" }
         } elseif ($crypttype -eq 3) {
-            $slot = 0x05
+            if ($fstype -eq 1) { $slot = 0x05 }
+            else { $status = "unknown" }
         } else {
             $status = "unknown"
         }
@@ -725,8 +765,16 @@ try {
             Status = $status
         }
 
+        # FIRM partitions are identified by their occurrence order (FIRM0, FIRM1),
+        # mirroring pyctr's firm_count handling. Both still decrypt with slot 0x06.
+        $roleTxt = ""
+        if ($fstype -eq 3) {
+            $roleTxt = if ($firmCount -eq 0) { ", role=FIRM0" } elseif ($firmCount -eq 1) { ", role=FIRM1" } else { ", role=FIRM$firmCount" }
+            $firmCount++
+        }
+
         $slotTxt = if ($status -eq "unknown") { "--" } else { "0x$($slot.ToString('X2'))" }
-        Write-Host "    Partition $i : slot=$slotTxt offset=0x$($absOffset.ToString('X8')) size=0x$($absSize.ToString('X8')) [$status]"
+        Write-Host "    Partition $i : slot=$slotTxt offset=0x$($absOffset.ToString('X8')) size=0x$($absSize.ToString('X8')) [$status$roleTxt]"
     }
 
     # Overlap check between non-empty partition-table entries
@@ -742,6 +790,24 @@ try {
                 throw "Partition table overlap: partition $($pa.Index) [0x$($aStart.ToString('X'))-0x$($aEnd.ToString('X'))] " +
                       "and partition $($pb.Index) [0x$($bStart.ToString('X'))-0x$($bEnd.ToString('X'))]"
             }
+        }
+    }
+
+    # --- TWL placement constraints (P0) ---
+    # The TWL decrypt coordinate system assumes the partition starts at NAND
+    # absolute offset 0 (encrypted ranges [0x1BE:0x200) + [0x12E00:end), with the
+    # MBR / blk0x1D / twln FAT checks computed from output offset 0). Reject any
+    # NCSD layout that breaks this assumption instead of producing garbage.
+    $twlParts = @($partitions | Where-Object { $_.Status -eq "twl" })
+    if ($twlParts.Count -gt 1) {
+        $twlIdxs = ($twlParts | ForEach-Object { $_.Index }) -join ", "
+        throw "NCSD: multiple TWL partitions found (indexes $twlIdxs); expected exactly one."
+    }
+    if ($twlParts.Count -eq 1) {
+        $twl = $twlParts[0]
+        if ($twl.Index -ne 0 -or $twl.Offset -ne 0) {
+            throw "NCSD: TWL partition must be index 0 with absolute offset 0 " +
+                  "(got index $($twl.Index), offset 0x$($twl.Offset.ToString('X'))); refusing to decrypt."
         }
     }
 
@@ -843,7 +909,8 @@ try {
                 if (-not $Force) {
                     throw "Output already exists: $outFile . Re-run with -Force to overwrite."
                 }
-                Remove-Item -LiteralPath $outFile -Force
+                # -Force: old file is NOT deleted here; replaced atomically at commit
+                # time after the new file has been written and validated.
             }
             if (Test-Path -LiteralPath $tmpFile -PathType Leaf) {
                 Remove-Item -LiteralPath $tmpFile -Force
@@ -935,8 +1002,9 @@ try {
                 # SHA-256 record for cross-run comparison
                 $shaHex = Get-FileSha256 $tmpFile
 
-                # Commit: rename .tmp to final name (overwrite already handled)
-                [System.IO.File]::Move($tmpFile, $outFile)
+                # Commit: atomic replace of the fully-verified .tmp file (old
+                # output survives any earlier failure; see Commit-TempFile).
+                Commit-TempFile $tmpFile $outFile
                 $tmpFiles = $tmpFiles | Where-Object { $_ -ne $tmpFile }
 
                 Write-Host "saved ($([Math]::Round($p.Size / 1MB, 1)) MB, wrote $written bytes, $checkNote)" -ForegroundColor Green

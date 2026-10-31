@@ -7,7 +7,7 @@
 
 ## 版本历史
 
-- **2.0（当前）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。**修复：零售 TWL keyX 中间 8 字节 "NINTENDO" 的 LE 打包常量错误**（真机零售 OTP 暴露，dev 分支不受影响）。
+- **2.0（当前，含第二轮审计修复，未推送）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。**修复：零售 TWL keyX 中间 8 字节 "NINTENDO" 的 LE 打包常量错误**（真机零售 OTP 暴露，dev 分支不受影响）。第二轮审计修复明细见下方「2.0 审计修复（第二轮）」。
 - **1.0（v0.2 加固版）**：依据外部代码审计系统性加固正确性/输入验证/输出验证/安全，并新增纯 JDK 11 GUI 实现与合成测试向量三端交叉验证。
 - **v0.1**：初版（PowerShell），已在用户实机 dump 上验证（见「验证状态」）。
 
@@ -21,6 +21,23 @@
 | 版本号 | 由 1.0 修正为 **2.0**（外部审计误把 1.0 读成 0.1；若按 0.x 口径应为 0.2 族，故新版本为 2.0） |
 | `DecryptCTRNandGUI.bat` | 已删除（不再需要任何启动器；双击 jar 即 GUI） |
 | GUI 修复 | 移除全部「浏览…」按钮，路径输入框仅保留文本输入（可拖放）；对应 i18n 键清理；新增工具栏「批量解密」按钮（一键启动所有已配置且未在运行的标签页任务） |
+
+### 2.0 审计修复（第二轮，P0/P1/P2/P3）
+
+| 审计项 | 处理（PS1 / Python / Java 三端） |
+|------|------|
+| P0 `-Force` 提前删除旧输出 | 一律改为：先写独立 `.tmp` → 结构校验 + SHA-256 → 最后原子替换提交；替换失败保留旧文件。PS1 新增 `Commit-TempFile`（`[IO.File]::Replace` 优先，非 NTFS 回退「旧→.bak、tmp→out、.bak 删除，swap 失败恢复」）；Python 用 `os.replace`；Java 用 `Files.move(ATOMIC_MOVE)` 回退 `REPLACE_EXISTING`。提前 `Remove-Item`/`os.remove`/`Files.delete` 旧文件逻辑全部移除 |
+| P0 TWL 分区位置约束 | NCSD 解析后强制：TWL 分区必须**唯一**、**索引 0**、**绝对偏移 0**，否则直接拒绝解密（MBR/blk0x1D/twln 校验与 counter 坐标系均假设偏移 0，非法布局不再继续尝试） |
+| P1 完整读取语义 | Python 新增通用 `read_exact()`（循环读满，EOF 抛 `EOFError`→`ValueError` 带段名）；Java 四处 NAND 读取 + NCSD 头改 `readFully()` + `EOFException`（区分真实截断与其他 I/O 错误）；PS1 已有 `ReadExactly` 循环 |
+| P1 crypttype=3 限 fstype | `crypt=1` 仅允许 `fs=1`（TWL）；`crypt=3` 仅允许 `fs=1`（New3DS CTRNAND slot05）；其余组合拒绝。与真机 NCSD 实证一致（RW/零售 p0 fs=1+crypt=1、p4 fs=1+crypt=2/3）。合成向量同步修正：TWL 的 fs 由自造约定 0x02 改为真机一致的 0x01 |
+| P1 CTR 非对齐尾块 | Java `aesCtrCrypt` 取消 `%16` 拒绝，改按 `(len+15)/16` 块生成 keystream、只异或 `len` 字节——三端统一支持最后不足 16 字节块 |
+| P2 TWL FAT OEM 断言 | twln boot 55AA 之外，真正断言 8 字节 OEM == `TWL     `（此前仅打印）；错误信息区分「55AA missing」与「OEM != TWL」 |
+| P2 FIRM0/FIRM1 识别 | NCSD 日志按出现顺序标注 `role=FIRM0/FIRM1/FIRMn`（pyctr `firm_count` 语义；映射仍 slot 0x06） |
+| P2 合成向量边界切片 | crosscheck 新增 5 组 TWL 边界比对：0x1BE-0x1FF（MBR 非对齐头）、0x1F0-0x20F（跨 counter block）、0x1F8-0x207（加密区结束切回原文）、0x12E00-0x12E1F（FAT 起始）、0x12E00-0x12E0F（单块） |
+| P3 Python `-Mode` 大小写 | `args.mode = args.mode.lower()` 置于校验前（`-Mode DEV` 兼容，与 PS1 ValidateSet / Java toLowerCase 一致） |
+| P3 Java GUI 取消语义 | SHA-256 循环内逐块检查取消标志（`fileSha256(..., cancelable, cancelled)`）+ 提交前再查一次；TWL 校验/提交阶段同样检查 |
+
+> 密钥派生、nonce、CTR 块内反转公式本轮审计静态对照无错误，未改动；所有修复均为工程/校验/安全语义，密码学结果应与修复前逐字节一致（见「验证状态」）。
 
 ### v0.2 变更（对照审计逐项）
 
@@ -74,11 +91,14 @@
 | Old3DS devkit（SN 已打码） | dev | ✅ **2.0 三端（PS1/Python/Java）全分区 PASS**（TWL raw OTP、MBR/blk0x1D/twln 三锚点 PASS；p2/p3 FIRM magic PASS；p4 CTRNAND MBR 55AA PASS；5 分区 SHA-256 三端逐字节一致） |
 | New3DS LL retail（SN 已打码） | retail | ✅ **2.0 三端（PS1/Python/Java）全分区 PASS**（TWL 三锚点 PASS；p2/p3 FIRM magic PASS；p4 crypt3→slot05 CTRNAND MBR 55AA PASS；5 分区 SHA-256 三端逐字节一致；零售 TWL keyX 字节序修复后复测通过） |
 
+**第二轮审计修复后复测（本轮）**：上表两机（Old3DS devkit / New3DS LL retail）三端全分区重跑，5 分区 SHA-256 三端逐字节一致，且与修复前输出**逐字节相同**（审计修复仅涉及工程/校验/安全语义，密码学结果零回归）；TWL FAT OEM `TWL     ` 断言、FIRM0/FIRM1 角色标注在真机日志中均 PASS。
+
 ### 合成向量三端交叉验证（`tests/`，本地保留、不入库）
 
 - `tests/` 整个目录已加入 `.gitignore` 并从远端仓库移除（本地保留做测试与真机素材）；
-- 构造含全部槽位映射的合成 NAND（CTRNAND slot04、FIRM slot06、AGB slot07、TWL slot03、New3DS CTRNAND slot05），dev / retail 各一套；
+- 构造含全部槽位映射的合成 NAND（CTRNAND slot04、FIRM slot06、AGB slot07、TWL slot03、New3DS CTRNAND slot05），dev / retail 各一套；TWL 分区 fs 类型与真机一致（0x01）；
 - **PS1、Python、Java 三端解密输出与 oracle 逐字节一致**，且三端互为一致；
+- 审计建议的 5 组 TWL 边界切片（0x1BE-0x1FF / 0x1F0-0x20F / 0x1F8-0x207 / 0x12E00-0x12E1F / 0x12E00-0x12E0F，覆盖 MBR 非对齐头、跨 counter block、加密区结束切回原文、FAT 起始）三端 × dev/retail 全部 PASS；
 - `-OtpDecrypted` 路径输出一致；
 - 负向用例通过：无 `-Force` 拒绝覆盖、零售模式拒绝 dev OTP（dev flag 一致性）、截断 NAND 拒绝、非法 CID hex 拒绝。
 

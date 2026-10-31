@@ -18,10 +18,10 @@
 
 - 从明文 boot9 + OTP + eMMC CID 派生 console-unique normalKey（slot 0x03 TWL + 0x04–0x07）
 - 自动解密 OTP（dev / retail 双模式，统一校验：DEADB00F + SHA256 + dev flag 与模式一致性）
-- 解析 NCSD 头与分区表（边界/重叠检查，未知 crypt/fs 组合拒绝解密、不猜 AES slot）
+- 解析 NCSD 头与分区表（边界/重叠检查；**TWL 分区强制唯一、索引 0、绝对偏移 0**；未知 crypt/fs 组合拒绝解密、不猜 AES slot）
 - 逐分区解密：CTRNAND / firm0 / firm1 / AGB save 走 AES-CTR（SHA256(CID)[:16] nonce）；**TWL 分区（slot 0x03）走 DSi 专用方案**（SHA1(CID)[:16] 反转 nonce + TWL keyscrambler + 每 16 字节块 keystream 反转 XOR；dev 必须用 raw OTP 派生 CustId）
-- 输出结构校验：CTRNAND MBR 55AA、FIRM magic、TWL blk0x1D 锚点 + MBR 55AA + twln FAT boot 55AA；核对实际写入字节数、记录每分区 SHA-256
-- 输出安全：先写 `.tmp`、校验通过后原子提交；默认拒绝覆盖（需 `-Force`）；密钥/CID 默认隐藏（`-ShowKeys` 显示）
+- 输出结构校验：CTRNAND MBR 55AA、FIRM magic、TWL blk0x1D 锚点 + MBR 55AA + twln FAT boot 55AA + OEM `TWL     `；核对实际写入字节数、记录每分区 SHA-256
+- 输出安全：先写 `.tmp`，全量校验通过后**原子替换**提交（失败保留旧文件）；默认拒绝覆盖（需 `-Force`）；密钥/CID 默认隐藏（`-ShowKeys` 显示）
 
 ## 使用
 
@@ -70,7 +70,7 @@ java -jar DecryptCTRNandGUI.jar -NandFile sysnand.bin -Boot9File boot9.bin -OtpF
 输出说明：
 
 - 默认仅输出状态行；`-ShowKeys` 时才显示 slot 0x03（TWL）与 0x04–0x07 normalKey 与 CID（敏感，默认隐藏）
-- 解密分区文件 `partition_N_slotNN.bin`（需 `-OutDir`）：先写 `.tmp`，通过结构校验 + 字节数核对后原子提交；每分区打印 SHA-256
+- 解密分区文件 `partition_N_slotNN.bin`（需 `-OutDir`）：先写 `.tmp`，通过结构校验 + 字节数核对 + SHA-256 后**原子替换**提交（`-Force` 覆盖时旧文件仅在新文件验证通过后才被替换，失败保留旧文件）；每分区打印 SHA-256
 - 未知 crypt/fs 类型的分区会明确跳过并提示，**不会**擅自套用某个 AES slot
 
 GUI 提示：路径输入框支持从资源管理器直接**拖放**文件/文件夹；每个标签页是一个独立解密任务，可同时运行（每任务独立日志与取消）；工具栏「**批量解密**」一键启动所有已配置（NAND 路径非空）且未在运行的标签页任务；语言内置「简体中文（默认）/ English」，切换即时生效。

@@ -99,6 +99,18 @@ def aes_ctr_crypt(key: bytes, counter: bytes, data: bytes) -> bytes:
     return cipher.decrypt(data)  # CTR decrypt == encrypt
 
 
+def read_exact(f, n: int) -> bytes:
+    """Read exactly n bytes or raise EOFError. read(n) is not guaranteed to fill
+    the buffer even when the stream has more data, so loop until done/real EOF."""
+    out = bytearray()
+    while len(out) < n:
+        chunk = f.read(n - len(out))
+        if not chunk:
+            raise EOFError(f"unexpected EOF: wanted {n} bytes, got {len(out)}")
+        out += chunk
+    return bytes(out)
+
+
 def add_counter(nonce: bytes, blocks: int) -> bytes:
     """nonce (16B BE) + blocks, truncated to 128 bits."""
     val = (int.from_bytes(nonce, 'big') + blocks) & MASK_128
@@ -214,6 +226,7 @@ def parse_ncsd(nand_path: str, nand_len: int) -> list:
         print(f"    [!] NCSD header declares size > file length; dump may be truncated")
 
     partitions = []
+    firm_count = 0
     for i in range(8):
         fstype = header[0x110 + i]
         crypttype = header[0x118 + i]
@@ -237,16 +250,21 @@ def parse_ncsd(nand_path: str, nand_len: int) -> list:
                 f"0x{nand_len:X}; dump truncated or partition table corrupt")
 
         # --- AES slot mapping (rule-based; refuses unknowns) ---
-        # crypt 0x01 = TWL (slot 0x03, dedicated nonce/key scheme)
-        # crypt 0x02: fs 0x01 = Old3DS CTRNAND -> slot 0x04
-        #             fs 0x03 = FIRM           -> slot 0x06
-        #             fs 0x04 = AGB_FIRM save  -> slot 0x07
-        # crypt 0x03 = New3DS CTRNAND         -> slot 0x05
+        # crypt 0x01: fs 0x01 = TWL             -> slot 0x03 (dedicated nonce/key scheme)
+        # crypt 0x02: fs 0x01 = Old3DS CTRNAND  -> slot 0x04
+        #             fs 0x03 = FIRM            -> slot 0x06
+        #             fs 0x04 = AGB_FIRM save   -> slot 0x07
+        # crypt 0x03: fs 0x01 = New3DS CTRNAND  -> slot 0x05
+        # (pyctr identifies partitions by fs type first, then encryption type;
+        #  unknown fs/crypt combinations are refused, not guessed.)
         slot = 0
         status = "decrypt"
         if crypttype == 1:
-            slot = 0x03
-            status = "twl"
+            if fstype == 1:
+                slot = 0x03
+                status = "twl"
+            else:
+                status = "unknown"
         elif crypttype == 2:
             if fstype == 1:
                 slot = 0x04
@@ -257,7 +275,10 @@ def parse_ncsd(nand_path: str, nand_len: int) -> list:
             else:
                 status = "unknown"
         elif crypttype == 3:
-            slot = 0x05
+            if fstype == 1:
+                slot = 0x05
+            else:
+                status = "unknown"
         else:
             status = "unknown"
 
@@ -270,8 +291,15 @@ def parse_ncsd(nand_path: str, nand_len: int) -> list:
             "slot": slot, "status": status,
         })
 
+        # FIRM partitions are identified by occurrence order (FIRM0, FIRM1),
+        # mirroring pyctr's firm_count handling. Both still decrypt with slot 0x06.
+        role_txt = ""
+        if fstype == 3:
+            role_txt = {0: ", role=FIRM0", 1: ", role=FIRM1"}.get(firm_count, f", role=FIRM{firm_count}")
+            firm_count += 1
+
         slot_txt = "--" if status == "unknown" else f"0x{slot:02X}"
-        print(f"    Partition {i}: slot={slot_txt} offset=0x{abs_offset:08X} size=0x{abs_size:08X} [{status}]")
+        print(f"    Partition {i}: slot={slot_txt} offset=0x{abs_offset:08X} size=0x{abs_size:08X} [{status}{role_txt}]")
 
     # overlap check
     for a in range(len(partitions)):
@@ -282,6 +310,23 @@ def parse_ncsd(nand_path: str, nand_len: int) -> list:
                     pb["offset"] + pb["size"] <= pa["offset"]):
                 raise ValueError(
                     f"Partition table overlap: partition {pa['index']} and partition {pb['index']}")
+
+    # --- TWL placement constraints (P0) ---
+    # The TWL decrypt coordinate system assumes the partition starts at NAND
+    # absolute offset 0 (encrypted ranges [0x1BE:0x200) + [0x12E00:end), with the
+    # MBR / blk0x1D / twln FAT checks computed from output offset 0). Reject any
+    # NCSD layout that breaks this assumption instead of producing garbage.
+    twl_parts = [p for p in partitions if p["status"] == "twl"]
+    if len(twl_parts) > 1:
+        raise ValueError(
+            "NCSD: multiple TWL partitions found (indexes "
+            + ", ".join(str(p["index"]) for p in twl_parts) + "); expected exactly one.")
+    if len(twl_parts) == 1:
+        twl = twl_parts[0]
+        if twl["index"] != 0 or twl["offset"] != 0:
+            raise ValueError(
+                f"NCSD: TWL partition must be index 0 with absolute offset 0 "
+                f"(got index {twl['index']}, offset 0x{twl['offset']:X}); refusing to decrypt.")
 
     return partitions
 
@@ -446,7 +491,8 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
     if os.path.exists(out_file):
         if not force:
             raise FileExistsError(f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
-        os.remove(out_file)
+        # -Force: old file is NOT removed here; os.replace() at commit time
+        # atomically swaps it only after the new file passed every check.
     if os.path.exists(tmp_file):
         os.remove(tmp_file)
 
@@ -467,8 +513,9 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
             head_end = min((pos + 15) & ~15, seg_end)
             n = head_end - pos
             nand.seek(pos)
-            chunk = nand.read(n)
-            if len(chunk) < n:
+            try:
+                chunk = read_exact(nand, n)
+            except EOFError:
                 raise ValueError(f"Partition {index}: NAND truncated (TWL head)")
             block_base = pos & ~15
             block_ctr = add_counter(twl_nonce, block_base // 16)
@@ -482,8 +529,9 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
         while pos < seg_end:
             to_read = min(CHUNK_SIZE, seg_end - pos)
             nand.seek(pos)
-            chunk = nand.read(to_read)
-            if len(chunk) < to_read:
+            try:
+                chunk = read_exact(nand, to_read)
+            except EOFError:
                 raise ValueError(f"Partition {index}: NAND truncated (TWL range)")
             counter = add_counter(twl_nonce, pos // 16)
             out.write(twl_ctr_crypt(twl_key, counter, chunk))
@@ -500,8 +548,9 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
                 while pos < es:
                     to_read = min(CHUNK_SIZE, es - pos)
                     nand.seek(pos)
-                    chunk = nand.read(to_read)
-                    if len(chunk) < to_read:
+                    try:
+                        chunk = read_exact(nand, to_read)
+                    except EOFError:
                         raise ValueError(f"Partition {index}: NAND truncated (raw range)")
                     out.write(chunk)
                     written += len(chunk)
@@ -513,8 +562,9 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
             while pos < end:
                 to_read = min(CHUNK_SIZE, end - pos)
                 nand.seek(pos)
-                chunk = nand.read(to_read)
-                if len(chunk) < to_read:
+                try:
+                    chunk = read_exact(nand, to_read)
+                except EOFError:
                     raise ValueError(f"Partition {index}: NAND truncated (tail range)")
                 out.write(chunk)
                 written += len(chunk)
@@ -548,10 +598,12 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
         else:
             raise ValueError(f"Partition {index}: TWL block 0x1D anchor mismatch (wrong key/OTP?)")
         if part["size"] > TWL_FAT_START + 0x200:
-            if fat_sig == b'\x55\xAA':
-                notes.append(f"twln boot 55AA OK (OEM={fat_oem!r})")
+            if fat_sig == b'\x55\xAA' and fat_oem == b'TWL     ':
+                notes.append("twln boot 55AA + OEM 'TWL     ' OK")
             else:
-                raise ValueError(f"Partition {index}: twln FAT boot 55AA missing (wrong offset?)")
+                raise ValueError(
+                    f"Partition {index}: twln FAT boot 55AA missing or OEM != 'TWL     ' "
+                    f"(got {fat_oem!r}, wrong offset?)")
         else:
             notes.append("twln boot check skipped (partition too small)")
 
@@ -576,7 +628,8 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
     if os.path.exists(out_file):
         if not force:
             raise FileExistsError(f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
-        os.remove(out_file)
+        # -Force: old file is NOT removed here; os.replace() at commit time
+        # atomically swaps it only after the new file passed every check.
     if os.path.exists(tmp_file):
         os.remove(tmp_file)
 
@@ -589,10 +642,11 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
             nand.seek(part["offset"])
             while remaining > 0:
                 to_read = min(CHUNK_SIZE, remaining)
-                chunk = nand.read(to_read)
-                if len(chunk) < to_read:
+                try:
+                    chunk = read_exact(nand, to_read)
+                except EOFError:
                     raise ValueError(
-                        f"Partition {index}: NAND truncated - expected {to_read} bytes, got {len(chunk)}")
+                        f"Partition {index}: NAND truncated - expected {to_read} bytes (unexpected EOF)")
                 abs_off = part["offset"] + (part["size"] - remaining)
                 counter = add_counter(nonce, abs_off // 16)
                 dec = aes_ctr_crypt(normal_key, counter, chunk)
@@ -716,6 +770,9 @@ def parse_args(argv):
 
 def main():
     args = parse_args(sys.argv[1:])
+    # -Mode is case-insensitive (PS1 ValidateSet / Java toLowerCase already are)
+    if isinstance(args.mode, str):
+        args.mode = args.mode.lower()
     if args.mode not in ("dev", "retail"):
         sys.exit(f"[!] -Mode must be dev or retail, got '{args.mode}'")
     if args.nand is None or args.boot9 is None or args.otp is None:

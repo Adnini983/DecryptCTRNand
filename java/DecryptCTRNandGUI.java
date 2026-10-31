@@ -34,6 +34,7 @@ import java.awt.datatransfer.DataFlavor;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
@@ -160,16 +161,14 @@ public class DecryptCTRNandGUI {
      * AES-CTR decrypt/encrypt in place. Counter block for a 16-byte block at
      * absolute NAND offset X = nonce + (X >> 4), 128-bit big-endian (pyctr
      * convention). One ECB pass over the whole counter stream per call.
-     * data.length must be a multiple of 16.
+     * A final partial block (< 16 bytes) is supported, matching the PS1/Python
+     * semantics: the last counter block's keystream is only partially consumed.
      */
     static byte[] aesCtrCrypt(byte[] key, byte[] nonce, long absOffset, byte[] data) {
-        if (data.length % 16 != 0) {
-            throw new RuntimeException("AES-CTR: data length " + data.length + " not a multiple of 16");
-        }
-        int blocks = data.length / 16;
+        int blocks = (data.length + 15) / 16;
         BigInteger base = new BigInteger(1, nonce).add(BigInteger.valueOf(absOffset >>> 4)).and(MASK_128);
         byte[] ctr = to16(base.toByteArray());
-        byte[] stream = new byte[data.length];
+        byte[] stream = new byte[blocks * 16];
         for (int i = 0; i < blocks; i++) {
             System.arraycopy(ctr, 0, stream, i * 16, 16);
             inc128(ctr);
@@ -293,7 +292,8 @@ public class DecryptCTRNandGUI {
             if (!force) {
                 throw new IOException("Output already exists: " + outFile + ". Re-run with --force to overwrite.");
             }
-            Files.delete(outFile);
+            // -Force: the old file is NOT deleted here. It is replaced at commit
+            // time only after the new file passed every check (see the move below).
         }
         Files.deleteIfExists(tmpFile);
 
@@ -319,11 +319,14 @@ public class DecryptCTRNandGUI {
                     if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
                     int toRead = (int) Math.min(CHUNK, es - pos);
                     raf.seek(pos);
-                    int read = raf.read(buf, 0, toRead);
-                    if (read < toRead) throw new IOException("Partition " + p.index + ": NAND truncated (raw range)");
-                    out.write(buf, 0, read);
-                    written += read;
-                    pos += read;
+                    try {
+                        raf.readFully(buf, 0, toRead); // readFully: no false short reads
+                    } catch (EOFException e) {
+                        throw new IOException("Partition " + p.index + ": NAND truncated (raw range)", e);
+                    }
+                    out.write(buf, 0, toRead);
+                    written += toRead;
+                    pos += toRead;
                 }
                 // decrypt [es, ee) - counters are per ABSOLUTE 16-byte block; handle misaligned head
                 while (pos < ee) {
@@ -331,8 +334,11 @@ public class DecryptCTRNandGUI {
                     if ((pos & 15) != 0) {
                         int headLen = (int) Math.min(16 - (pos & 15), ee - pos);
                         raf.seek(pos);
-                        int read = raf.read(buf, 0, headLen);
-                        if (read < headLen) throw new IOException("Partition " + p.index + ": NAND truncated (TWL head)");
+                        try {
+                            raf.readFully(buf, 0, headLen);
+                        } catch (EOFException e) {
+                            throw new IOException("Partition " + p.index + ": NAND truncated (TWL head)", e);
+                        }
                         long blockBase = pos & ~15L;
                         byte[] ks = aesEcbEncrypt(twlKey, counterFor(twlNonce, blockBase));
                         int rel = (int) (pos - blockBase);
@@ -347,8 +353,11 @@ public class DecryptCTRNandGUI {
                     }
                     int toRead = (int) Math.min(CHUNK, ee - pos);
                     raf.seek(pos);
-                    int read = raf.read(buf, 0, toRead);
-                    if (read < toRead) throw new IOException("Partition " + p.index + ": NAND truncated (TWL range)");
+                    try {
+                        raf.readFully(buf, 0, toRead);
+                    } catch (EOFException e) {
+                        throw new IOException("Partition " + p.index + ": NAND truncated (TWL range)", e);
+                    }
                     byte[] dec = twlCtrCrypt(twlKey, counterFor(twlNonce, pos), Arrays.copyOf(buf, toRead));
                     out.write(dec);
                     written += toRead;
@@ -360,11 +369,14 @@ public class DecryptCTRNandGUI {
                 if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
                 int toRead = (int) Math.min(CHUNK, end - pos);
                 raf.seek(pos);
-                int read = raf.read(buf, 0, toRead);
-                if (read < toRead) throw new IOException("Partition " + p.index + ": NAND truncated (tail range)");
-                out.write(buf, 0, read);
-                written += read;
-                pos += read;
+                try {
+                    raf.readFully(buf, 0, toRead);
+                } catch (EOFException e) {
+                    throw new IOException("Partition " + p.index + ": NAND truncated (tail range)", e);
+                }
+                out.write(buf, 0, toRead);
+                written += toRead;
+                pos += toRead;
             }
         }
 
@@ -394,6 +406,7 @@ public class DecryptCTRNandGUI {
             }
             fatSigOk = (fat[0x1FE] & 0xFF) == 0x55 && (fat[0x1FF] & 0xFF) == 0xAA;
             oem = new String(fat, 3, 8, java.nio.charset.StandardCharsets.US_ASCII);
+            fatSigOk = fatSigOk && "TWL     ".equals(oem); // FAT boot OEM label (8 bytes)
         }
 
         String checkNote;
@@ -407,13 +420,15 @@ public class DecryptCTRNandGUI {
         }
         if (!fatSigOk) {
             Files.deleteIfExists(tmpFile);
-            throw new IOException("Partition " + p.index + ": twln FAT boot 55AA missing (wrong offset?)");
+            throw new IOException("Partition " + p.index + ": twln FAT boot 55AA missing or OEM != 'TWL     ' (wrong offset?)");
         }
         checkNote = fatChecked
-                ? "MBR 55AA OK, blk0x1D anchor OK, twln boot 55AA OK (OEM='" + oem + "')"
+                ? "MBR 55AA OK, blk0x1D anchor OK, twln boot 55AA + OEM 'TWL     ' OK"
                 : "MBR 55AA OK, blk0x1D anchor OK, twln boot check skipped (partition too small)";
 
-        String sha = fileSha256(tmpFile);
+        if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
+        String sha = fileSha256(tmpFile, cancelable, cancelled);
+        if (cancelable && cancelled.get()) throw new IOException("Cancelled by user."); // final check before commit
         try {
             Files.move(tmpFile, outFile, StandardCopyOption.ATOMIC_MOVE);
         } catch (java.nio.file.AtomicMoveNotSupportedException e) {
@@ -518,9 +533,10 @@ public class DecryptCTRNandGUI {
     static List<Partition> parseNcsd(Path nand, long nandLen) throws IOException {
         byte[] header = new byte[0x200];
         try (RandomAccessFile raf = new RandomAccessFile(nand.toFile(), "r")) {
-            int read = raf.read(header);
-            if (read < 0x200) {
-                throw new RuntimeException("NAND: truncated NCSD header (read " + read + " of 0x200 bytes)");
+            try {
+                raf.readFully(header);
+            } catch (EOFException e) {
+                throw new RuntimeException("NAND: truncated NCSD header (unexpected EOF)", e);
             }
         }
         if (header[0x100] != 'N' || header[0x101] != 'C' || header[0x102] != 'S' || header[0x103] != 'D') {
@@ -535,6 +551,7 @@ public class DecryptCTRNandGUI {
         }
 
         List<Partition> parts = new ArrayList<>();
+        int firmCount = 0;
         for (int i = 0; i < 8; i++) {
             int fstype = header[0x110 + i] & 0xFF;
             int crypttype = header[0x118 + i] & 0xFF;
@@ -562,6 +579,13 @@ public class DecryptCTRNandGUI {
             }
 
             // --- AES slot mapping (rule-based; refuses unknowns) ---
+            // crypt 0x01: fs 0x01 = TWL             -> slot 0x03 (dedicated nonce/key scheme)
+            // crypt 0x02: fs 0x01 = Old3DS CTRNAND  -> slot 0x04
+            //             fs 0x03 = FIRM            -> slot 0x06
+            //             fs 0x04 = AGB_FIRM save   -> slot 0x07
+            // crypt 0x03: fs 0x01 = New3DS CTRNAND  -> slot 0x05
+            // (pyctr identifies partitions by fs type first, then encryption type;
+            //  unknown fs/crypt combinations are refused, not guessed.)
             Partition p = new Partition();
             p.index = i;
             p.fstype = fstype;
@@ -570,15 +594,20 @@ public class DecryptCTRNandGUI {
             p.size = absSize;
             p.status = "decrypt";
             if (crypttype == 1) {
-                p.slot = 0x03;
-                p.status = "twl"; // TWL: dedicated key (raw OTP for dev) + SHA1(CID) nonce + reversed-block CTR
+                if (fstype == 1) {
+                    p.slot = 0x03;
+                    p.status = "twl"; // TWL: dedicated key (raw OTP for dev) + SHA1(CID) nonce + reversed-block CTR
+                } else {
+                    p.status = "unknown";
+                }
             } else if (crypttype == 2) {
                 if (fstype == 1) p.slot = 0x04;            // Old3DS CTRNAND
                 else if (fstype == 3) p.slot = 0x06;       // FIRM
                 else if (fstype == 4) p.slot = 0x07;       // AGB save
                 else p.status = "unknown";
             } else if (crypttype == 3) {
-                p.slot = 0x05;                             // New3DS CTRNAND
+                if (fstype == 1) p.slot = 0x05;            // New3DS CTRNAND
+                else p.status = "unknown";
             } else {
                 p.status = "unknown";
             }
@@ -589,9 +618,17 @@ public class DecryptCTRNandGUI {
             }
             parts.add(p);
 
+            // FIRM partitions are identified by occurrence order (FIRM0, FIRM1),
+            // mirroring pyctr's firm_count handling. Both still decrypt with slot 0x06.
+            String roleTxt = "";
+            if (fstype == 3) {
+                roleTxt = firmCount == 0 ? ", role=FIRM0" : firmCount == 1 ? ", role=FIRM1" : ", role=FIRM" + firmCount;
+                firmCount++;
+            }
+
             String slotTxt = "unknown".equals(p.status) ? "--" : String.format("0x%02X", p.slot);
             log("    Partition " + i + ": slot=" + slotTxt + " offset=0x" + String.format("%08X", absOffset)
-                    + " size=0x" + String.format("%08X", absSize) + " [" + p.status + "]");
+                    + " size=0x" + String.format("%08X", absSize) + " [" + p.status + roleTxt + "]");
         }
 
         // overlap check
@@ -603,6 +640,26 @@ public class DecryptCTRNandGUI {
                             + " and partition " + pb.index);
                 }
             }
+        }
+
+        // --- TWL placement constraints (P0) ---
+        // The TWL decrypt coordinate system assumes the partition starts at NAND
+        // absolute offset 0 (encrypted ranges [0x1BE:0x200) + [0x12E00:end), with the
+        // MBR / blk0x1D / twln FAT checks computed from output offset 0). Reject any
+        // NCSD layout that breaks this assumption instead of producing garbage.
+        Partition twlPart = null;
+        for (Partition pp : parts) {
+            if ("twl".equals(pp.status)) {
+                if (twlPart != null) {
+                    throw new RuntimeException("NCSD: multiple TWL partitions found (indexes "
+                            + twlPart.index + ", " + pp.index + "); expected exactly one.");
+                }
+                twlPart = pp;
+            }
+        }
+        if (twlPart != null && (twlPart.index != 0 || twlPart.offset != 0)) {
+            throw new RuntimeException("NCSD: TWL partition must be index 0 with absolute offset 0 (got index "
+                    + twlPart.index + ", offset 0x" + Long.toHexString(twlPart.offset) + "); refusing to decrypt.");
         }
         return parts;
     }
@@ -668,7 +725,8 @@ public class DecryptCTRNandGUI {
             if (!force) {
                 throw new IOException("Output already exists: " + outFile + ". Re-run with --force to overwrite.");
             }
-            Files.delete(outFile);
+            // -Force: the old file is NOT deleted here. It is replaced at commit
+            // time only after the new file passed every check (see the move below).
         }
         Files.deleteIfExists(tmpFile);
 
@@ -687,10 +745,11 @@ public class DecryptCTRNandGUI {
                         throw new IOException("Cancelled by user.");
                     }
                     int toRead = (int) Math.min(CHUNK, remaining);
-                    int read = raf.read(buf, 0, toRead);
-                    if (read < toRead) {
+                    try {
+                        raf.readFully(buf, 0, toRead); // readFully: no false short reads
+                    } catch (EOFException e) {
                         throw new IOException("Partition " + p.index + ": NAND truncated - expected "
-                                + toRead + " bytes, got " + read);
+                                + toRead + " bytes (unexpected EOF)", e);
                     }
                     long absOff = p.offset + (p.size - remaining);
                     byte[] dec = aesCtrCrypt(key, nonce, absOff, Arrays.copyOf(buf, toRead));
@@ -736,7 +795,9 @@ public class DecryptCTRNandGUI {
                 throw new IOException("Partition " + p.index + ": structural check failed - " + checkNote);
             }
 
-            String sha = fileSha256(tmpFile);
+            if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
+            String sha = fileSha256(tmpFile, cancelable, cancelled);
+            if (cancelable && cancelled.get()) throw new IOException("Cancelled by user."); // final check before commit
             try {
                 Files.move(tmpFile, outFile, StandardCopyOption.ATOMIC_MOVE);
             } catch (java.nio.file.AtomicMoveNotSupportedException e) {
@@ -757,7 +818,7 @@ public class DecryptCTRNandGUI {
         }
     }
 
-    static String fileSha256(Path p) throws IOException {
+    static String fileSha256(Path p, boolean cancelable, java.util.concurrent.atomic.AtomicBoolean cancelled) throws IOException {
         MessageDigest md;
         try {
             md = MessageDigest.getInstance("SHA-256");
@@ -767,7 +828,10 @@ public class DecryptCTRNandGUI {
         byte[] buf = new byte[CHUNK];
         try (java.io.InputStream in = Files.newInputStream(p)) {
             int n;
-            while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
+            while ((n = in.read(buf)) > 0) {
+                if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
+                md.update(buf, 0, n);
+            }
         }
         return toHex(md.digest());
     }
