@@ -1,7 +1,7 @@
 /*
  * DecryptCTRNandGUI - 3DS NAND Dump Decryptor (Pure JDK 11, zero external deps)
  *
- * v0.2.1 - Java implementation kept byte-for-byte compatible with
+ * 2.0 - Java implementation kept byte-for-byte compatible with
  *        DecryptCTRNand.ps1 / DecryptCTRNand.py (see tests/).
  *
  * Pure JDK only: javax.swing + javax.crypto + java.util.BigInteger.
@@ -11,7 +11,7 @@
  *          -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out -Force
  *     (a leading --cli is also accepted; legacy --nand-style aliases too)
  *
- * GUI (v0.2.1):
+ * GUI (2.0):
  *   - Tabbed multi-task: each tab is an independent decryption task; tasks run
  *     concurrently (per-task log routing + cancellation, ThreadLocal-based).
  *   - Drag & drop: path fields accept dropped files/folders from the OS.
@@ -56,6 +56,13 @@ public class DecryptCTRNandGUI {
     static final BigInteger C1 = new BigInteger("1FF9E9AAC5FE0408024591DC5D52768A", 16);
     static final BigInteger MASK_128 = BigInteger.ONE.shiftLeft(128).subtract(BigInteger.ONE);
     static final byte[] FIXED_KEYY_CTRNAND_NEW = hex("4D804F4E9990194613A204AC584460BE");
+    // TWL (DSi NAND, slot 0x03) constants
+    static final BigInteger TWL_CONST = new BigInteger("FFFEFB4E295902582A680F5F1A4F3E79", 16);
+    static final byte[] KEYY_TWL_DEV = hex("AABF76F17AB8E86697646A260500A0E1");
+    static final byte[] KEYY_TWL_RETAIL = hex("76DCB90AD3C44DBD1DDD2D200500A0E1");
+    static final byte[] TWL_BLK1D_ANCHOR = hex("8e400601a0c38d800400b30501000000");
+    static final long TWL_MBR_START = 0x1BE;
+    static final long TWL_FAT_START = 0x12E00;
     static final int CHUNK = 0x100000;
     static final int[] KEY_Y_OFFSETS = {0x1F0, 0x210, 0x220}; // slots 0x04, 0x06, 0x07
     static final String[] EXPECTED_SLOT_NAMES = {"slot04", "slot06", "slot07", "slot05"};
@@ -170,6 +177,258 @@ public class DecryptCTRNandGUI {
         byte[] ks = aesEcbEncrypt(key, stream);
         for (int i = 0; i < data.length; i++) data[i] ^= ks[i];
         return data;
+    }
+
+    // ---------------- TWL (DSi NAND, slot 0x03) ----------------
+    static byte[] sha1(byte[] data) {
+        try {
+            return MessageDigest.getInstance("SHA-1").digest(data);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static void putU32LE(byte[] b, int off, long v) {
+        b[off] = (byte) v;
+        b[off + 1] = (byte) (v >> 8);
+        b[off + 2] = (byte) (v >> 16);
+        b[off + 3] = (byte) (v >> 24);
+    }
+
+    static byte[] rev16(byte[] b) {
+        byte[] out = new byte[16];
+        for (int i = 0; i < 16; i++) out[i] = b[15 - i];
+        return out;
+    }
+
+    /** DSi/TWL keyscrambler: ROL42(((keyX_LE ^ keyY_LE) + TWL_CONST) mod 2^128), BE output. */
+    static byte[] scrambleTwl(byte[] keyX, byte[] keyY) {
+        BigInteger kx = new BigInteger(1, rev16(keyX));
+        BigInteger ky = new BigInteger(1, rev16(keyY));
+        BigInteger t = kx.xor(ky).add(TWL_CONST).and(MASK_128);
+        BigInteger r = t.shiftLeft(42).or(t.shiftRight(86)).and(MASK_128);
+        return to16(r.toByteArray());
+    }
+
+    /**
+     * TWL NAND (slot 0x03) normal key.
+     * dev   : CustId = RAW (encrypted) OTP[0:8] little-endian (otp_dec is WRONG here)
+     * retail: CustId = OTP_plain[8:16] ^ 0x08C267B7B358A6AF | 0x80000000
+     */
+    static byte[] deriveTwlKey(byte[] otpEnc, byte[] otpPlain, boolean dev) {
+        long lo, hi;
+        byte[] keyy;
+        if (dev) {
+            lo = readU32LE(otpEnc, 0);
+            hi = readU32LE(otpEnc, 4);
+            keyy = KEYY_TWL_DEV;
+        } else {
+            lo = readU32LE(otpPlain, 8);
+            hi = readU32LE(otpPlain, 12);
+            lo = (lo ^ 0xB358A6AFL) | 0x80000000L;
+            hi = hi ^ 0x08C267B7L;
+            keyy = KEYY_TWL_RETAIL;
+        }
+        byte[] keyx = new byte[16];
+        putU32LE(keyx, 0, lo);
+        putU32LE(keyx, 4, dev ? 0xEE7A4B1EL : 0x4E494E54L);
+        putU32LE(keyx, 8, dev ? 0xAF42C08BL : 0x454E444FL);
+        putU32LE(keyx, 12, hi);
+        return scrambleTwl(keyx, keyy);
+    }
+
+    /** TWL nonce = SHA1(CID)[:16], byte-reversed (BE128 of the LE128 integer). */
+    static byte[] deriveTwlNonce(byte[] cid) {
+        byte[] sh = sha1(cid);
+        byte[] n = new byte[16];
+        for (int i = 0; i < 16; i++) n[i] = sh[15 - i];
+        return n;
+    }
+
+    /** Re-encrypt plaintext OTP back to its raw form (TWL dev CustId needs the raw OTP). */
+    static byte[] encryptOtp(byte[] otpPlain, byte[] boot9, String mode) {
+        int otpBase = boot9.length == 0x10000 ? 0x8000 : 0;
+        int nkOff = otpBase + ("dev".equals(mode) ? 0x5700 : 0x56E0);
+        return aesCbc(Cipher.ENCRYPT_MODE, sub(boot9, nkOff, 16), sub(boot9, nkOff + 16, 16), otpPlain);
+    }
+
+    /** 128-bit big-endian counter = nonce + (absOffset >> 4). */
+    static byte[] counterFor(byte[] nonce, long absOffset) {
+        BigInteger base = new BigInteger(1, nonce).add(BigInteger.valueOf(absOffset >>> 4)).and(MASK_128);
+        return to16(base.toByteArray());
+    }
+
+    /**
+     * TWL CTR: keystream block = AES-ECB(key, BE128(counter)), XORed byte-reversed per
+     * 16-byte block (the DSi AES engine processes blocks in reversed byte order;
+     * pyctr _TWLCryptoWrapper). NOT interchangeable with aesCtrCrypt.
+     */
+    static byte[] twlCtrCrypt(byte[] key, byte[] counter, byte[] data) throws Exception {
+        int nBlocks = (data.length + 15) / 16;
+        byte[] ctrStream = new byte[nBlocks * 16];
+        byte[] ctr = counter.clone();
+        for (int i = 0; i < nBlocks; i++) {
+            System.arraycopy(ctr, 0, ctrStream, i * 16, 16);
+            inc128(ctr);
+        }
+        byte[] ks = aesEcbEncrypt(key, ctrStream);
+        byte[] out = new byte[data.length];
+        for (int i = 0; i < data.length; i++) {
+            int blockBase = (i / 16) * 16;
+            int rev = blockBase + 15 - (i % 16);
+            out[i] = (byte) (data[i] ^ ks[rev]);
+        }
+        return out;
+    }
+
+    // ---------------- TWL partition decryption ----------------
+    static void decryptTwlPartition(Path nand, Partition p, byte[] twlKey, byte[] twlNonce,
+                                    Path outDir, boolean force, boolean cancelable,
+                                    java.util.concurrent.atomic.AtomicBoolean cancelled) throws Exception {
+        String name = String.format("partition_%d_slot03.bin", p.index);
+        Path outFile = outDir.resolve(name);
+        Path tmpFile = outDir.resolve(name + ".tmp");
+
+        if (Files.exists(outFile)) {
+            if (!force) {
+                throw new IOException("Output already exists: " + outFile + ". Re-run with --force to overwrite.");
+            }
+            Files.delete(outFile);
+        }
+        Files.deleteIfExists(tmpFile);
+
+        log("    Partition " + p.index + " (slot 0x03, TWL)...");
+
+        long start = p.offset;
+        long end = p.offset + p.size;
+        long[][] encRanges = {
+                {TWL_MBR_START, Math.min(0x200, end)},
+                {Math.max(TWL_FAT_START, start), end},
+        };
+        long written = 0;
+        byte[] buf = new byte[CHUNK];
+        try (RandomAccessFile raf = new RandomAccessFile(nand.toFile(), "r");
+             java.io.OutputStream out = Files.newOutputStream(tmpFile, StandardOpenOption.CREATE,
+                     StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            long pos = start;
+            for (long[] range : encRanges) {
+                long es = range[0], ee = range[1];
+                if (es >= ee) continue;
+                // raw copy [pos, es)
+                while (pos < es) {
+                    if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
+                    int toRead = (int) Math.min(CHUNK, es - pos);
+                    raf.seek(pos);
+                    int read = raf.read(buf, 0, toRead);
+                    if (read < toRead) throw new IOException("Partition " + p.index + ": NAND truncated (raw range)");
+                    out.write(buf, 0, read);
+                    written += read;
+                    pos += read;
+                }
+                // decrypt [es, ee) - counters are per ABSOLUTE 16-byte block; handle misaligned head
+                while (pos < ee) {
+                    if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
+                    if ((pos & 15) != 0) {
+                        int headLen = (int) Math.min(16 - (pos & 15), ee - pos);
+                        raf.seek(pos);
+                        int read = raf.read(buf, 0, headLen);
+                        if (read < headLen) throw new IOException("Partition " + p.index + ": NAND truncated (TWL head)");
+                        long blockBase = pos & ~15L;
+                        byte[] ks = aesEcbEncrypt(twlKey, counterFor(twlNonce, blockBase));
+                        int rel = (int) (pos - blockBase);
+                        byte[] dec = new byte[headLen];
+                        for (int j = 0; j < headLen; j++) {
+                            dec[j] = (byte) (buf[j] ^ ks[15 - (rel + j)]);
+                        }
+                        out.write(dec);
+                        written += headLen;
+                        pos += headLen;
+                        continue;
+                    }
+                    int toRead = (int) Math.min(CHUNK, ee - pos);
+                    raf.seek(pos);
+                    int read = raf.read(buf, 0, toRead);
+                    if (read < toRead) throw new IOException("Partition " + p.index + ": NAND truncated (TWL range)");
+                    byte[] dec = twlCtrCrypt(twlKey, counterFor(twlNonce, pos), Arrays.copyOf(buf, toRead));
+                    out.write(dec);
+                    written += toRead;
+                    pos += toRead;
+                }
+            }
+            // tail raw copy
+            while (pos < end) {
+                if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
+                int toRead = (int) Math.min(CHUNK, end - pos);
+                raf.seek(pos);
+                int read = raf.read(buf, 0, toRead);
+                if (read < toRead) throw new IOException("Partition " + p.index + ": NAND truncated (tail range)");
+                out.write(buf, 0, read);
+                written += read;
+                pos += read;
+            }
+        }
+
+        if (written != p.size) {
+            throw new IOException("Partition " + p.index + ": wrote " + written + " bytes but expected " + p.size);
+        }
+
+        // --- TWL structural checks (sanity only; AES-CTR is not authenticated) ---
+        byte[] mbr = new byte[0x42];
+        try (RandomAccessFile f = new RandomAccessFile(tmpFile.toFile(), "r")) {
+            f.seek(0x1BE);
+            int n = f.read(mbr);
+            if (n < 0x42) throw new IOException("Partition " + p.index + ": output too short for TWL MBR checks");
+        }
+        boolean mbrSigOk = (mbr[0x40] & 0xFF) == 0x55 && (mbr[0x41] & 0xFF) == 0xAA;
+        boolean blk1dOk = java.util.Arrays.equals(sub(mbr, 0x12, 16), TWL_BLK1D_ANCHOR);
+
+        boolean fatChecked = p.size > TWL_FAT_START + 0x200;
+        boolean fatSigOk = true;
+        String oem = "<skipped>";
+        if (fatChecked) {
+            byte[] fat = new byte[0x200];
+            try (RandomAccessFile f = new RandomAccessFile(tmpFile.toFile(), "r")) {
+                f.seek(0x12E00);
+                int n = f.read(fat);
+                if (n < 0x200) throw new IOException("Partition " + p.index + ": TWL region too small for twln boot check");
+            }
+            fatSigOk = (fat[0x1FE] & 0xFF) == 0x55 && (fat[0x1FF] & 0xFF) == 0xAA;
+            oem = new String(fat, 3, 8, java.nio.charset.StandardCharsets.US_ASCII);
+        }
+
+        String checkNote;
+        if (!mbrSigOk) {
+            Files.deleteIfExists(tmpFile);
+            throw new IOException("Partition " + p.index + ": TWL MBR 55AA missing (wrong key/OTP?)");
+        }
+        if (!blk1dOk) {
+            Files.deleteIfExists(tmpFile);
+            throw new IOException("Partition " + p.index + ": TWL block 0x1D anchor mismatch (wrong key/OTP?)");
+        }
+        if (!fatSigOk) {
+            Files.deleteIfExists(tmpFile);
+            throw new IOException("Partition " + p.index + ": twln FAT boot 55AA missing (wrong offset?)");
+        }
+        checkNote = fatChecked
+                ? "MBR 55AA OK, blk0x1D anchor OK, twln boot 55AA OK (OEM='" + oem + "')"
+                : "MBR 55AA OK, blk0x1D anchor OK, twln boot check skipped (partition too small)";
+
+        String sha = fileSha256(tmpFile);
+        try {
+            Files.move(tmpFile, outFile, StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            Files.move(tmpFile, outFile, StandardCopyOption.REPLACE_EXISTING);
+        }
+        log(String.format("        saved (%s, wrote %d bytes, %s)",
+                p.size / 1048576.0 == Math.floor(p.size / 1048576.0)
+                        ? (p.size / 1048576) + " MB"
+                        : String.format("%.1f MB", p.size / 1048576.0),
+                written, checkNote));
+        log("        SHA-256: " + sha);
+        try {
+            Files.deleteIfExists(tmpFile);
+        } catch (IOException ignored) {
+        }
     }
 
     // ---------------- OTP ----------------
@@ -287,7 +546,7 @@ public class DecryptCTRNandGUI {
             long absOffset = offsetUnits * 0x200;
             long absSize = sizeUnits * 0x200;
 
-            if (absOffset < 0x200) {
+            if (absOffset < 0x200 && crypttype != 1) {
                 log("    [!] Partition " + i + ": bogus offset 0x" + Long.toHexString(absOffset)
                         + " (overlaps NCSD header), skipped");
                 continue;
@@ -312,7 +571,7 @@ public class DecryptCTRNandGUI {
             p.status = "decrypt";
             if (crypttype == 1) {
                 p.slot = 0x03;
-                p.status = "unsupported"; // TWL nonce scheme not implemented
+                p.status = "twl"; // TWL: dedicated key (raw OTP for dev) + SHA1(CID) nonce + reversed-block CTR
             } else if (crypttype == 2) {
                 if (fstype == 1) p.slot = 0x04;            // Old3DS CTRNAND
                 else if (fstype == 3) p.slot = 0x06;       // FIRM
@@ -460,7 +719,8 @@ public class DecryptCTRNandGUI {
                         checkNote = "MBR 55AA MISSING (wrong key/offset?)";
                     }
                 } else if (p.slot == 0x06) {
-                    if (n >= 0x104 && head[0x100] == 'F' && head[0x101] == 'I' && head[0x102] == 'R' && head[0x103] == 'M') {
+                    // FIRM image starts at partition offset 0x00 ("FIRM" magic at +0)
+                    if (n >= 0x04 && head[0] == 'F' && head[1] == 'I' && head[2] == 'R' && head[3] == 'M') {
                         checkNote = "FIRM magic OK";
                     } else {
                         checkOk = false;
@@ -557,7 +817,7 @@ public class DecryptCTRNandGUI {
         long nandLen = Files.size(nandPath);
         if (nandLen < 0x200) throw new RuntimeException("NAND: file too small to contain an NCSD header (< 0x200 bytes)");
 
-        log("=== DecryptCTRNand v0.2 (Java) ===");
+        log("=== DecryptCTRNand 2.0 (Java) ===");
         log("NAND: " + o.nand);
         log("boot9: " + o.boot9);
         log("OTP: " + o.otp);
@@ -572,6 +832,9 @@ public class DecryptCTRNandGUI {
             log("[*] Using pre-decrypted OTP (validating anyway)");
             validateOtp(otpRaw, o.mode, "from file");
             otpPlain = otpRaw;
+            // Re-encrypt the plaintext back to its raw form: TWL (slot 0x03) derives its
+            // dev CustId from the RAW OTP[0:8], so otp_dec.mem alone would give wrong keys.
+            otpRaw = encryptOtp(otpPlain, boot9, o.mode);
             log("[+] OTP plaintext valid");
         } else {
             log("[*] Decrypting OTP...");
@@ -588,18 +851,22 @@ public class DecryptCTRNandGUI {
         // 4. keyinit
         log("[*] Keyinit (OTP + boot9 -> console-unique normalKeys)...");
         java.util.Map<Integer, byte[]> normalKeys = keyinit(otpPlain, boot9, "dev".equals(o.mode));
+        byte[] twlKey = deriveTwlKey(otpRaw, otpPlain, "dev".equals(o.mode));
+        byte[] twlNonce = deriveTwlNonce(cid);
         if (o.showKeys) {
             log("[+] Derived normalKeys:");
+            log("    slot 0x03 (TWL): " + toHex(twlKey));
             for (int slot = 0x04; slot <= 0x07; slot++) {
                 log("    slot 0x" + String.format("%02X", slot) + ": " + toHex(normalKeys.get(slot)));
             }
         } else {
-            log("[+] Derived normalKeys (slots 0x04-0x07): OK (hidden; use -ShowKeys to display)");
+            log("[+] Derived normalKeys (slots 0x03-0x07, incl. TWL): OK (hidden; use -ShowKeys to display)");
         }
 
         // 5. nonce
         byte[] nonce = sub(sha256(cid), 0, 16);
         log("[+] CTR nonce derived (SHA256(CID)[:16], hidden)");
+        log("[+] TWL nonce derived (SHA1(CID)[:16] reversed, hidden)");
 
         // 6. partitions
         if (o.outdir == null || o.outdir.isEmpty()) {
@@ -612,6 +879,11 @@ public class DecryptCTRNandGUI {
                 if (cancelable && cancelled.get()) throw new RuntimeException("Cancelled by user.");
                 if ("unknown".equals(p.status)) {
                     log("    Partition " + p.index + ": unknown crypt/fs type, skipped");
+                    continue;
+                }
+                if ("twl".equals(p.status)) {
+                    decryptTwlPartition(nandPath, p, twlKey, twlNonce, outDir,
+                            o.force, cancelable, cancelled);
                     continue;
                 }
                 if (!normalKeys.containsKey(p.slot)) {
@@ -628,7 +900,7 @@ public class DecryptCTRNandGUI {
         log("OTP: valid (" + o.mode + ")");
         log("NCSD: parsed, " + parts.size() + " non-empty partition(s)");
         log("CID: loaded (hidden)");
-        log("Keyinit: completed (slots 0x04-0x07)");
+        log("Keyinit: completed (slots 0x03-0x07, incl. TWL)");
         log("nonce: derived");
         if (o.outdir != null && !o.outdir.isEmpty()) {
             log("Partitions: decrypted to " + o.outdir + " (structural checks applied)");
@@ -641,7 +913,7 @@ public class DecryptCTRNandGUI {
 
     // ---------------- CLI ----------------
     static void printCliHelp() {
-        System.out.println("DecryptCTRNand v0.2 (Java) - 3DS NAND Dump Decryptor CLI");
+        System.out.println("DecryptCTRNand 2.0 (Java) - 3DS NAND Dump Decryptor CLI");
         System.out.println();
         System.out.println("Usage:");
         System.out.println("  java -jar DecryptCTRNandGUI.jar -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem>");
@@ -799,7 +1071,7 @@ public class DecryptCTRNandGUI {
 
         static {
             java.util.Map<String, String> zh = new java.util.HashMap<>();
-            zh.put("title", "DecryptCTRNand v0.2.1 - 3DS NAND 解密工具（纯 JDK 11）");
+            zh.put("title", "DecryptCTRNand 2.0 - 3DS NAND 解密工具（纯 JDK 11）");
             zh.put("newTask", "＋ 新建任务");
             zh.put("closeTab", "×");
             zh.put("language", "语言:");
@@ -827,7 +1099,7 @@ public class DecryptCTRNandGUI {
             register("zh-CN", zh);
 
             java.util.Map<String, String> en = new java.util.HashMap<>();
-            en.put("title", "DecryptCTRNand v0.2.1 - 3DS NAND Decryptor (Pure JDK 11)");
+            en.put("title", "DecryptCTRNand 2.0 - 3DS NAND Decryptor (Pure JDK 11)");
             en.put("newTask", "+ New Task");
             en.put("closeTab", "×");
             en.put("language", "Language:");

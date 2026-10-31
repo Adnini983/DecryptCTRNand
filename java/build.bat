@@ -10,7 +10,7 @@ jar cfm DecryptCTRNandGUI.jar MANIFEST.MF -C classes .
 if errorlevel 1 goto :err
 echo.
 echo Built: %~dp0DecryptCTRNandGUI.jar  (pure JDK 11, zero external dependencies)
-echo Double-click DecryptCTRNandGUI.bat in the repo root to open the GUI.
+echo Double-click DecryptCTRNandGUI.jar itself to open the GUI (no launcher bat needed).
 exit /b 0
 :err
 echo BUILD FAILED

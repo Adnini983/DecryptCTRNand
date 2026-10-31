@@ -1,5 +1,5 @@
 @echo off
-REM DecryptCTRNand - Windows BAT launcher (v0.2)
+REM DecryptCTRNand - Windows BAT launcher (2.0)
 REM Calls the PowerShell implementation with all arguments passed through.
 REM
 REM Parameters (see README.md for details):
