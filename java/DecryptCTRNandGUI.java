@@ -1085,7 +1085,7 @@ public class DecryptCTRNandGUI {
             zh.put("otpDec", "OTP 已是解密明文 (-OtpDecrypted)");
             zh.put("force", "允许覆盖已有输出 (-Force)");
             zh.put("showKeys", "显示派生密钥 (-ShowKeys)");
-            zh.put("browse", "浏览…");
+            zh.put("outdir", "输出目录:");
             zh.put("start", "开始解密");
             zh.put("cancel", "取消");
             zh.put("working", "处理中…");
@@ -1113,7 +1113,6 @@ public class DecryptCTRNandGUI {
             en.put("otpDec", "OTP is already decrypted (-OtpDecrypted)");
             en.put("force", "Force overwrite existing outputs");
             en.put("showKeys", "Show derived keys (-ShowKeys)");
-            en.put("browse", "Browse...");
             en.put("start", "Start Decryption");
             en.put("cancel", "Cancel");
             en.put("working", "Working...");
@@ -1272,11 +1271,6 @@ public class DecryptCTRNandGUI {
         final JTextArea logArea = new JTextArea();
         final JButton startBtn = new JButton();
         final JButton cancelBtn = new JButton();
-        final JButton bNand = new JButton();
-        final JButton bBoot9 = new JButton();
-        final JButton bOtp = new JButton();
-        final JButton bCid = new JButton();
-        final JButton bOutdir = new JButton();
         final JLabel labNand = new JLabel();
         final JLabel labBoot9 = new JLabel();
         final JLabel labOtp = new JLabel();
@@ -1297,12 +1291,12 @@ public class DecryptCTRNandGUI {
             c.insets = new Insets(4, 6, 4, 6);
             c.anchor = GridBagConstraints.WEST;
 
-            addRow(form, c, 0, labNand, nandField, bNand, false);
-            addRow(form, c, 1, labBoot9, boot9Field, bBoot9, false);
-            addRow(form, c, 2, labOtp, otpField, bOtp, false);
-            addRow(form, c, 3, labCidHex, cidHexField, null, false);
-            addRow(form, c, 4, labCidFile, cidFileField, bCid, false);
-            addRow(form, c, 5, labOutdir, outdirField, bOutdir, true);
+            addRow(form, c, 0, labNand, nandField);
+            addRow(form, c, 1, labBoot9, boot9Field);
+            addRow(form, c, 2, labOtp, otpField);
+            addRow(form, c, 3, labCidHex, cidHexField);
+            addRow(form, c, 4, labCidFile, cidFileField);
+            addRow(form, c, 5, labOutdir, outdirField);
 
             c.gridx = 1;
             c.gridy++;
@@ -1354,7 +1348,7 @@ public class DecryptCTRNandGUI {
         }
 
         void addRow(JPanel form, GridBagConstraints c, int y, JLabel label,
-                    JTextField field, JButton browseBtn, boolean dirsOnly) {
+                    JTextField field) {
             c.gridx = 0;
             c.gridy = y + 1;
             form.add(label, c);
@@ -1363,16 +1357,6 @@ public class DecryptCTRNandGUI {
             c.weightx = 1.0;
             form.add(field, c);
             c.weightx = 0;
-            if (browseBtn != null) {
-                browseBtn.addActionListener(e -> {
-                    JFileChooser fc = new JFileChooser();
-                    if (dirsOnly) fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-                    if (fc.showOpenDialog(TaskPanel.this) == JFileChooser.APPROVE_OPTION) {
-                        field.setText(fc.getSelectedFile().getAbsolutePath());
-                    }
-                });
-                form.add(browseBtn, c);
-            }
             c.fill = GridBagConstraints.NONE;
         }
 
@@ -1421,9 +1405,6 @@ public class DecryptCTRNandGUI {
             showKeysBox.setText(Lang.t("showKeys"));
             startBtn.setText(Lang.t("start"));
             cancelBtn.setText(Lang.t("cancel"));
-            for (JButton b : new JButton[]{bNand, bBoot9, bOtp, bCid, bOutdir}) {
-                b.setText(Lang.t("browse"));
-            }
             for (JTextField f : new JTextField[]{nandField, boot9Field, otpField,
                     cidFileField, outdirField}) {
                 f.setToolTipText(Lang.t("dropHint"));
