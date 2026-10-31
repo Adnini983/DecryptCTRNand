@@ -5,6 +5,10 @@ java/classes/
 # test run output (vectors/ and expected/ are committed for instant cross-check)
 tests/out/
 
+# the whole tests tree is local-only (real NAND dumps, tooling, scratch);
+# nothing under tests/ is committed or pushed
+tests/
+
 # temp files
 *.tmp
 tests/vectors/nand_truncated.bin
