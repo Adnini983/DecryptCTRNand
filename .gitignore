@@ -2,16 +2,16 @@
 java/classes/
 *.jar
 
-# test run output (vectors/ and expected/ are committed for instant cross-check)
+# test run output, and the generated vectors (reproducible: python tests\make_testvectors.py)
+# tests\expected\ IS committed: it is the pinned oracle used for regression checks.
 tests/out/
+tests/vectors/
+tests/vec_log.txt
 
-# the whole tests tree is local-only (real NAND dumps, tooling, scratch);
-# nothing under tests/ is committed or pushed
-tests/
-
-# temp files
+# temp files (unique per-run names are <out>.<guid>.tmp / <out>.bak.<guid>)
 *.tmp
-tests/vectors/nand_truncated.bin
+*.bak
+*.bak.*
 
 # AI-agent onboarding doc (local only, not committed)
 AGENTS.md

@@ -7,7 +7,9 @@
 
 ## 版本历史
 
-- **2.0（当前，含第二轮审计修复，未推送）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。**修复：零售 TWL keyX 中间 8 字节 "NINTENDO" 的 LE 打包常量错误**（真机零售 OTP 暴露，dev 分支不受影响）。第二轮审计修复明细见下方「2.0 审计修复（第二轮）」。
+- **2.1.1（当前源码，未发布）**：并发输出安全与提交语义加固（三端同构）：临时文件改为随机唯一命名（`<out>.<guid>.tmp`）；未 `-Force` 时提交阶段**不覆盖**已存在的输出（PS1 `File::Move` 失败即报错、Python `os.link` + `os.unlink`、Java 不带 `REPLACE_EXISTING` 的 `Files.move`）；PS1 非原子回退改用唯一 `.bak` 名，不再删除用户已有的 `<out>.bak`；TWL twln FAT boot 检查边界 `>` → `>=`（恰好 `0x13000` 字节的分区不再被跳过）；Java TWL 路径补 `finally` 清理 `.tmp`；GUI 拒绝两个运行中任务共用同一输出目录，取消后显示「已取消」而非「错误」；三端 banner / GUI 标题 / CLI 帮助统一为 2.1.1。明细见「2.1.1 变更」。
+- **2.1.0（已发布，tag `2.1.0` = `149a64d`）**：第二轮审计修复（P0/P1/P2/P3），明细见「2.1.0 审计修复（第二轮）」。**注意**：2.1.0 的源码 banner 仍打印 2.0，且 README 当时未同步——这正是 2.1.1 统一版本号的起因。
+- **2.0（tag `2.0.0` = `7f18716`，发布资产为修复前版本）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。**修复：零售 TWL keyX 中间 8 字节 "NINTENDO" 的 LE 打包常量错误**（真机零售 OTP 暴露，dev 分支不受影响）。
 - **1.0（v0.2 加固版）**：依据外部代码审计系统性加固正确性/输入验证/输出验证/安全，并新增纯 JDK 11 GUI 实现与合成测试向量三端交叉验证。
 - **v0.1**：初版（PowerShell），已在用户实机 dump 上验证（见「验证状态」）。
 
@@ -22,7 +24,7 @@
 | `DecryptCTRNandGUI.bat` | 已删除（不再需要任何启动器；双击 jar 即 GUI） |
 | GUI 修复 | 移除全部「浏览…」按钮，路径输入框仅保留文本输入（可拖放）；对应 i18n 键清理；新增工具栏「批量解密」按钮（一键启动所有已配置且未在运行的标签页任务） |
 
-### 2.0 审计修复（第二轮，P0/P1/P2/P3）
+### 2.1.0 审计修复（第二轮，P0/P1/P2/P3）
 
 | 审计项 | 处理（PS1 / Python / Java 三端） |
 |------|------|
@@ -38,6 +40,20 @@
 | P3 Java GUI 取消语义 | SHA-256 循环内逐块检查取消标志（`fileSha256(..., cancelable, cancelled)`）+ 提交前再查一次；TWL 校验/提交阶段同样检查 |
 
 > 密钥派生、nonce、CTR 块内反转公式本轮审计静态对照无错误，未改动；所有修复均为工程/校验/安全语义，密码学结果应与修复前逐字节一致（见「验证状态」）。
+
+### 2.1.1 变更（并发 / 提交安全）
+
+| 审计项 | 2.1.1 处理（PS1 / Python / Java 三端） |
+|------|------|
+| 多任务共用输出目录（GUI 多标签、多进程） | 临时文件改为随机唯一名 `<out>.<guid>.tmp`：两个任务不会再互相 truncate / 删除对方正在写的 `.tmp`。GUI 启动任务时检查目标目录是否已被其他运行中任务占用，冲突即拒绝并提示 |
+| 未 `-Force` 仍可能覆盖（检查与提交间的 TOCTOU） | 提交阶段重新判定，不再只依赖开跑前的一次存在性检查：PS1 `[IO.File]::Move`（目标存在则失败）、Python `os.link` + `os.unlink`（存在则 `FileExistsError`）、Java 不带 `REPLACE_EXISTING` 的 `Files.move`（实测抛 `FileAlreadyExistsException`）；只有 `-Force` 才走替换路径 |
+| PS1 非原子回退删除用户 `.bak` | 备份名改为 `<out>.bak.<guid>`，只在本次回退内创建和删除，绝不删除用户原有的 `<out>.bak` |
+| twln FAT 检查漏判（`>` vs `>=`） | 分区恰好 `0x12E00 + 0x200 = 0x13000` 字节时也执行 FAT boot 校验（三端统一为 `>=`） |
+| Java TWL 路径失败残留 `.tmp` | `decryptTwlPartition` 外层加 `try/finally`，任何异常或取消都会删除本次 `.tmp`；同时移除结构校验分支里重复的清理语句 |
+| GUI 取消被显示为错误 | `done()` 在 `ExecutionException` 分支先判断取消标志，显示「已取消」而非「错误」 |
+| 版本号自相矛盾 | 三端 banner / GUI 标题 / CLI 帮助统一由常量 `VERSION = "2.1.1"` 输出，不再写死 2.0 |
+
+> 以上均为工程与提交语义改动，密码学路径未改；合成向量三端结果与 2.1.0 逐字节一致（见「验证状态」）。
 
 ### v0.2 变更（对照审计逐项）
 
@@ -91,16 +107,19 @@
 | Old3DS devkit（SN 已打码） | dev | ✅ **2.0 三端（PS1/Python/Java）全分区 PASS**（TWL raw OTP、MBR/blk0x1D/twln 三锚点 PASS；p2/p3 FIRM magic PASS；p4 CTRNAND MBR 55AA PASS；5 分区 SHA-256 三端逐字节一致） |
 | New3DS LL retail（SN 已打码） | retail | ✅ **2.0 三端（PS1/Python/Java）全分区 PASS**（TWL 三锚点 PASS；p2/p3 FIRM magic PASS；p4 crypt3→slot05 CTRNAND MBR 55AA PASS；5 分区 SHA-256 三端逐字节一致；零售 TWL keyX 字节序修复后复测通过） |
 
-**第二轮审计修复后复测（本轮）**：上表两机（Old3DS devkit / New3DS LL retail）三端全分区重跑，5 分区 SHA-256 三端逐字节一致，且与修复前输出**逐字节相同**（审计修复仅涉及工程/校验/安全语义，密码学结果零回归）；TWL FAT OEM `TWL     ` 断言、FIRM0/FIRM1 角色标注在真机日志中均 PASS。
+**第二轮审计修复后复测（2.1.0）**：上表两机（Old3DS devkit / New3DS LL retail）三端全分区重跑，5 分区 SHA-256 三端逐字节一致，且与修复前输出**逐字节相同**（审计修复仅涉及工程/校验/安全语义，密码学结果零回归）；TWL FAT OEM `TWL     ` 断言、FIRM0/FIRM1 角色标注在真机日志中均 PASS。
 
-### 合成向量三端交叉验证（`tests/`，本地保留、不入库）
+**2.1.1 回归（合成向量，本轮）**：三端（PS1 / Python / Java）对 dev / retail 两套向量 5 分区全部逐字节一致，TWL 5 组边界切片全 PASS，`-OtpDecrypted` PASS；新增负向用例（失败时旧输出逐字节不变且不残留 `.tmp`、重复 TWL 分区被拒、TWL 非零偏移被拒）三端全 PASS。2.1.1 未改动密码学路径，**本轮未重跑真机 dump**（本机无真机素材），真机基线以上表为准。
 
-- `tests/` 整个目录已加入 `.gitignore` 并从远端仓库移除（本地保留做测试与真机素材）；
+### 合成向量三端交叉验证（`tests/`，合成套件随仓库公开）
+
+- `tests/` 只公开**合成**资产（`make_testvectors.py`、`run_crosscheck.ps1`、`expected/` 固定 oracle）；`vectors/` 由生成器确定性重建、`out/` 为运行产物，两者被忽略；真机 dump / OTP / CID 一律不入库。用法与局限见 `tests/README.md`；
 - 构造含全部槽位映射的合成 NAND（CTRNAND slot04、FIRM slot06、AGB slot07、TWL slot03、New3DS CTRNAND slot05），dev / retail 各一套；TWL 分区 fs 类型与真机一致（0x01）；
 - **PS1、Python、Java 三端解密输出与 oracle 逐字节一致**，且三端互为一致；
 - 审计建议的 5 组 TWL 边界切片（0x1BE-0x1FF / 0x1F0-0x20F / 0x1F8-0x207 / 0x12E00-0x12E1F / 0x12E00-0x12E0F，覆盖 MBR 非对齐头、跨 counter block、加密区结束切回原文、FAT 起始）三端 × dev/retail 全部 PASS；
 - `-OtpDecrypted` 路径输出一致；
-- 负向用例通过：无 `-Force` 拒绝覆盖、零售模式拒绝 dev OTP（dev flag 一致性）、截断 NAND 拒绝、非法 CID hex 拒绝。
+- 负向用例通过：无 `-Force` 拒绝覆盖、零售模式拒绝 dev OTP（dev flag 一致性）、截断 NAND 拒绝、非法 CID hex 拒绝；**失败时旧输出逐字节不变且不残留 `.tmp`**、**重复 TWL 分区被拒**、**TWL 非零偏移被拒**（2.1.1 新增，三端）。
+- **局限（务必知悉）**：生成器复用工具自身的 TWL 原语加密向量，属于自洽测试；TWL 密码学的对称性错误不会被该套件发现，真机基线才是算法锚点。
 
 ## 已知限制
 
@@ -108,10 +127,11 @@
 - **TWL dev 必须 raw OTP**：dev 开发机的 TWL CustId 取 **raw（加密）OTP[0:8]**；若手头只有 `otp_dec.mem`，工具会自动用 OTP normalKey 重加密回 raw 再派生（无需手工操作）。
 - **组件级解析**：仅完成解密与结构验证（MBR / FIRM magic / TWL 锚点），NAND FS 挂载与文件系统级分析需后续工具。
 - **NCSD 尺寸警告**：真机 NAND 的 NCSD 头声明名义大小（O3DS 0x40000000 / N3DS 0x50000000）大于实际镜像（0x3AF00000 / 0x4D800000），工具会提示「dump may be truncated」——对完整真机 dump 属误报，解密不受影响。
+- **并发/提交语义**：未 `-Force` 时提交是「不覆盖」语义（先到者胜，后者报错且不改动已有文件）；`-Force` 下同一路径的并发写属于最后提交者胜出，工具不提供跨进程锁。GUI 内部会拒绝两个运行中任务共用同一输出目录。
 
-## 测试（`tests/` 为本地目录，不入库）
+## 测试（合成套件随仓库公开）
 
-`tests/` 整个目录已在 `.gitignore` 中排除并从远端移除，克隆仓库后不会包含；在本地保留完整测试资产（合成向量 + 真机 dump 素材）。
+`tests/` 只提交**合成**资产：生成器、交叉验证脚本与固定 oracle（`expected/`）；`vectors/` 可由生成器确定性重建、`out/` 为运行产物，二者被 `.gitignore` 忽略。真机 dump / OTP / CID 等素材不入库。详见 `tests/README.md`。
 
 ```powershell
 # 1) 生成合成向量（boot9/OTP/CID/NCSD，含 oracle 期望输出）
@@ -125,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1
 powershell -ExecutionPolicy Bypass -File tests\run_crosscheck.ps1 -JavaJar java\DecryptCTRNandGUI.jar
 ```
 
-退出码 0 = 全部通过。
+退出码 0 = 全部通过。负向用例额外覆盖：失败时旧输出逐字节不变且无 `.tmp` 残留、重复 TWL 分区、TWL 非零偏移（2.1.1 新增）。
 
 ## 敏感口径
 
