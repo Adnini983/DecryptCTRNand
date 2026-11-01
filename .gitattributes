@@ -1,0 +1,3 @@
+# Regression baselines and generated vectors are raw binary: never apply EOL
+# conversion or text diffing (keeps bytes identical under core.autocrlf=true).
+*.bin binary
