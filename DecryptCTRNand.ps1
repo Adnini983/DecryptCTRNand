@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    DecryptCTRNand 2.0 - 3DS NAND Dump Decryptor (Windows Native: PowerShell + .NET)
+    DecryptCTRNand 2.1.1 - 3DS NAND Dump Decryptor (Windows Native: PowerShell + .NET)
 
 .DESCRIPTION
     Decrypt 3DS NAND dumps using plaintext boot9 + OTP + eMMC CID.
@@ -19,9 +19,20 @@
       * Structural output checks: MBR 55AA (CTRNAND), FIRM magic (firm partitions),
         actual written byte count, per-partition SHA-256 record.
       * Overwrite protection: refuses to overwrite existing outputs unless -Force.
-      * Keys written to a .tmp file first and renamed only after checks pass.
+      * Output is written to a temp file first and published only after checks pass.
       * normalKeys / CID are hidden by default; use -ShowKeys to display.
       * try/finally resource cleanup.
+
+    v2.1.1 changes (concurrency / commit safety):
+      * Temp files get a unique per-run name (<out>.<guid>.tmp), so two tasks
+        writing the same output directory cannot truncate or delete each
+        other's in-flight .tmp file.
+      * Publishing without -Force is no-clobber: [IO.File]::Move fails when the
+        destination appeared meanwhile, instead of silently replacing it.
+      * The non-atomic fallback uses a unique *.bak name and never deletes a
+        pre-existing <out>.bak that belongs to the user.
+      * The twln FAT boot check no longer skips a partition of exactly
+        0x12E00 + 0x200 bytes (boundary is now >=).
 
 .NOTES
     Naming motivation: GodMode9 cannot fully decrypt dev NAND on-device;
@@ -61,6 +72,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:Version = "2.1.1"
 
 # === Inline C# crypto helpers ===
 Add-Type -TypeDefinition @"
@@ -284,6 +296,13 @@ function SubBytes($src, $offset, $length) {
     return $dst
 }
 
+# Unique per-run temp path: two concurrent tasks that target the same output
+# directory must never share a .tmp file (they would truncate/delete each
+# other's in-flight data).
+function New-TempPath([string]$outFile) {
+    return "$outFile.$([guid]::NewGuid().ToString('N')).tmp"
+}
+
 # ReadExactly: keeps reading until $count bytes are filled or EOF.
 # Returns the number of bytes actually read (may be < $count only at EOF).
 function ReadExactly($stream, $buffer, $offset, $count) {
@@ -296,21 +315,30 @@ function ReadExactly($stream, $buffer, $offset, $count) {
     return $total
 }
 
-# Commit-TempFile: atomically publish a fully-verified .tmp file as the final
-# output. The old output file is NEVER deleted in advance - it survives any
-# mid-decrypt failure and is only replaced once the new file has been written
-# and validated. On NTFS, [IO.File]::Replace is atomic; if the filesystem does
-# not support it we fall back to a backup-and-swap that still restores the old
-# file if the swap itself fails.
-function Commit-TempFile([string]$tmpFile, [string]$outFile) {
+# Commit-TempFile: publish a fully-verified .tmp file as the final output.
+# Without -Force this is a no-clobber publish: [IO.File]::Move refuses to
+# overwrite an existing destination (atomic on NTFS), so a concurrent task that
+# created the same output meanwhile is never silently overwritten. With -Force
+# the old file is replaced atomically ([IO.File]::Replace); the fallback for
+# filesystems without it uses a UNIQUE backup name, so a pre-existing
+# <out>.bak that belongs to the user is never deleted.
+function Commit-TempFile([string]$tmpFile, [string]$outFile, [bool]$Force) {
+    if (-not $Force) {
+        try {
+            [System.IO.File]::Move($tmpFile, $outFile)
+        } catch [System.IO.IOException] {
+            if (Test-Path -LiteralPath $outFile -PathType Leaf) {
+                throw "Output already exists: $outFile . Re-run with -Force to overwrite."
+            }
+            throw
+        }
+        return
+    }
     if (Test-Path -LiteralPath $outFile -PathType Leaf) {
         try {
             [System.IO.File]::Replace($tmpFile, $outFile, $null)
         } catch {
-            # Non-atomic fallback: move the old file aside, swap in the new one,
-            # and roll the old file back if the swap fails.
-            $bak = "$outFile.bak"
-            if (Test-Path -LiteralPath $bak -PathType Leaf) { Remove-Item -LiteralPath $bak -Force }
+            $bak = "$outFile.bak.$([guid]::NewGuid().ToString('N'))"
             [System.IO.File]::Move($outFile, $bak)
             try {
                 [System.IO.File]::Move($tmpFile, $outFile)
@@ -405,7 +433,7 @@ function Get-TwlNonce([byte[]]$cid) {
 function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
     $index = $p.Index
     $outFile = Join-Path $OutDir "partition_${index}_slot03.bin"
-    $tmpFile = "$outFile.tmp"
+    $tmpFile = New-TempPath $outFile
 
     if (Test-Path -LiteralPath $outFile -PathType Leaf) {
         if (-not $Force) { throw "Output already exists: $outFile . Re-run with -Force to overwrite." }
@@ -417,7 +445,6 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
     }
 
     Write-Host "    Partition $index (slot 0x03, TWL)... " -NoNewline
-
     $start = [long]$p.Offset
     $end = $start + [long]$p.Size
     $mbrStart = 0x1BE
@@ -515,7 +542,7 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
         $fatSigOk = $true
         $oemOk = $true
         $oem = ""
-        if ($p.Size -gt 0x12E00 + 0x200) {
+        if ($p.Size -ge 0x12E00 + 0x200) {
             # twln FAT boot sector only exists if the TWL region actually covers it
             $fat = New-Object byte[] 0x200
             $hfs2 = [System.IO.File]::OpenRead($tmpFile)
@@ -544,14 +571,14 @@ function Out-TwlPartition($nandFs, $p, $twlKey, $twlNonce, $OutDir, $Force) {
             if (Test-Path -LiteralPath $tmpFile) { Remove-Item -LiteralPath $tmpFile -Force }
             throw "Partition $index : twln FAT boot 55AA missing or OEM != 'TWL     ' (got '$oem', wrong offset?)"
         }
-        if ($p.Size -gt 0x12E00 + 0x200) {
+        if ($p.Size -ge 0x12E00 + 0x200) {
             $notes += "twln boot 55AA + OEM 'TWL     ' OK"
         } else {
             $notes += "twln boot check skipped (partition too small)"
         }
 
         $shaHex = Get-FileSha256 $tmpFile
-        Commit-TempFile $tmpFile $outFile
+        Commit-TempFile $tmpFile $outFile ([bool]$Force)
 
         Write-Host "saved ($([Math]::Round($p.Size / 1MB, 1)) MB, wrote $written bytes, $($notes -join ', '))" -ForegroundColor Green
         Write-Host "        SHA-256: $shaHex" -ForegroundColor DarkGray
@@ -590,7 +617,7 @@ function Assert-ValidOtpPlain([byte[]]$plain, [string]$mode, [string]$sourceDesc
 }
 
 # === Main ===
-Write-Host "=== DecryptCTRNand 2.0 ===" -ForegroundColor Cyan
+Write-Host "=== DecryptCTRNand $script:Version ===" -ForegroundColor Cyan
 Write-Host "NAND: $NandFile"
 Write-Host "boot9: $Boot9File"
 Write-Host "OTP: $OtpFile"
@@ -903,7 +930,7 @@ try {
 
             $nk = $normalKeys[$slot]
             $outFile = Join-Path $OutDir "partition_$($p.Index)_slot$($slot.ToString('X2')).bin"
-            $tmpFile = "$outFile.tmp"
+            $tmpFile = New-TempPath $outFile
 
             if (Test-Path -LiteralPath $outFile -PathType Leaf) {
                 if (-not $Force) {
@@ -1004,7 +1031,7 @@ try {
 
                 # Commit: atomic replace of the fully-verified .tmp file (old
                 # output survives any earlier failure; see Commit-TempFile).
-                Commit-TempFile $tmpFile $outFile
+                Commit-TempFile $tmpFile $outFile ([bool]$Force)
                 $tmpFiles = $tmpFiles | Where-Object { $_ -ne $tmpFile }
 
                 Write-Host "saved ($([Math]::Round($p.Size / 1MB, 1)) MB, wrote $written bytes, $checkNote)" -ForegroundColor Green

@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-decrypt3dsnand 2.0 - 3DS NAND Dump Decryptor (Pure Python)
+decrypt3dsnand 2.1.1 - 3DS NAND Dump Decryptor (Pure Python)
 
 Decrypt 3DS NAND dumps using plaintext boot9 + OTP + eMMC CID.
 Dependencies: pycryptodome (Crypto.Cipher.AES)
+
+v2.1.1 (concurrency / commit safety, kept in sync with DecryptCTRNand.ps1):
+  * Temp files get a unique per-run name (<out>.<uuid>.tmp), so two tasks
+    writing the same output directory cannot truncate/delete each other's
+    in-flight .tmp file.
+  * Publishing without -Force is no-clobber: the file is committed with
+    os.link() (atomic, fails with FileExistsError if the name appeared
+    meanwhile) instead of os.replace(), which would silently overwrite.
+  * The twln FAT boot check no longer skips a partition of exactly
+    0x12E00 + 0x200 bytes (boundary is now >=).
 
 v2.0 (kept in sync with DecryptCTRNand.ps1):
   * keyinit() now receives dev/retail from --mode (was hardcoded dev=True, which
@@ -33,6 +43,7 @@ import hashlib
 import os
 import struct
 import sys
+import uuid
 
 try:
     from Crypto.Cipher import AES
@@ -41,6 +52,7 @@ except ImportError:
     sys.exit("[!] pycryptodome is required: pip install pycryptodome")
 
 # === Constants ===
+VERSION = "2.1.1"
 # 3DS AES key scrambler C1 constant (reverse-engineered from dev slot0x2C)
 C1 = int.from_bytes(bytes.fromhex("1FF9E9AAC5FE0408024591DC5D52768A"), byteorder='big')
 MASK_128 = (1 << 128) - 1
@@ -134,6 +146,36 @@ def file_sha256(path: str) -> str:
                 break
             h.update(chunk)
     return h.hexdigest().upper()
+
+
+def temp_path(out_file: str) -> str:
+    """Unique per-run temp path: two tasks may target the same output directory."""
+    return f"{out_file}.{uuid.uuid4().hex}.tmp"
+
+
+def commit_file(tmp_file: str, out_file: str, force: bool) -> None:
+    """Publish tmp_file as out_file: replace only with -Force, otherwise refuse.
+
+    os.replace() always overwrites, so the no-clobber path uses a hard link: it
+    is atomic and raises FileExistsError if the target appeared in the meantime.
+    """
+    if force:
+        os.replace(tmp_file, out_file)
+        return
+    try:
+        os.link(tmp_file, out_file)
+    except FileExistsError:
+        raise FileExistsError(
+            f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
+    except OSError:
+        # Filesystem without hard-link support: narrow the race window, then
+        # fall back to a checked replace.
+        if os.path.exists(out_file):
+            raise FileExistsError(
+                f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
+        os.replace(tmp_file, out_file)
+        return
+    os.unlink(tmp_file)
 
 
 # === Input validation ===
@@ -486,13 +528,13 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
     """
     index = part["index"]
     out_file = os.path.join(outdir, f"partition_{index}_slot03.bin")
-    tmp_file = out_file + ".tmp"
+    tmp_file = temp_path(out_file)
 
     if os.path.exists(out_file):
         if not force:
             raise FileExistsError(f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
-        # -Force: old file is NOT removed here; os.replace() at commit time
-        # atomically swaps it only after the new file passed every check.
+        # -Force: old file is NOT removed here; commit_file() swaps it only after
+        # the new file passed every check.
     if os.path.exists(tmp_file):
         os.remove(tmp_file)
 
@@ -579,7 +621,7 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
             mbr_sig = f.read(2)
             f.seek(0x1D0)
             blk1d = f.read(16)
-            if part["size"] > TWL_FAT_START + 0x200:
+            if part["size"] >= TWL_FAT_START + 0x200:
                 f.seek(TWL_FAT_START + 0x1FE)
                 fat_sig = f.read(2)
                 f.seek(TWL_FAT_START + 0x03)
@@ -597,7 +639,7 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
             notes.append("blk0x1D anchor OK")
         else:
             raise ValueError(f"Partition {index}: TWL block 0x1D anchor mismatch (wrong key/OTP?)")
-        if part["size"] > TWL_FAT_START + 0x200:
+        if part["size"] >= TWL_FAT_START + 0x200:
             if fat_sig == b'\x55\xAA' and fat_oem == b'TWL     ':
                 notes.append("twln boot 55AA + OEM 'TWL     ' OK")
             else:
@@ -608,7 +650,7 @@ def decrypt_twl_partition(nand_path: str, part: dict, twl_key: bytes, twl_nonce:
             notes.append("twln boot check skipped (partition too small)")
 
         sha_hex = file_sha256(tmp_file)
-        os.replace(tmp_file, out_file)
+        commit_file(tmp_file, out_file, force)
 
         print(f"saved ({part['size'] / 1048576:.1f} MB, wrote {written} bytes, {', '.join(notes)})")
         print(f"        SHA-256: {sha_hex}")
@@ -623,13 +665,13 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
     index = part["index"]
     slot = part["slot"]
     out_file = os.path.join(outdir, f"partition_{index}_slot{slot:02X}.bin")
-    tmp_file = out_file + ".tmp"
+    tmp_file = temp_path(out_file)
 
     if os.path.exists(out_file):
         if not force:
             raise FileExistsError(f"Output already exists: {out_file}. Re-run with -Force to overwrite.")
-        # -Force: old file is NOT removed here; os.replace() at commit time
-        # atomically swaps it only after the new file passed every check.
+        # -Force: old file is NOT removed here; commit_file() swaps it only after
+        # the new file passed every check.
     if os.path.exists(tmp_file):
         os.remove(tmp_file)
 
@@ -683,7 +725,7 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
             raise ValueError(f"Partition {index}: structural check failed - {check_note}")
 
         sha_hex = file_sha256(tmp_file)
-        os.replace(tmp_file, out_file)  # commit
+        commit_file(tmp_file, out_file, force)  # no-clobber unless -Force
 
         print(f"saved ({part['size'] / 1048576:.1f} MB, wrote {written} bytes, {check_note})")
         print(f"        SHA-256: {sha_hex}")
@@ -693,7 +735,7 @@ def decrypt_partition(nand_path: str, part: dict, normal_key: bytes, nonce: byte
 
 
 def print_help():
-    print("""decrypt3dsnand 2.0 - 3DS NAND Dump Decryptor (Pure Python, pycryptodome)
+    print(f"""decrypt3dsnand {VERSION} - 3DS NAND Dump Decryptor (Pure Python, pycryptodome)
 
 Usage:
   python DecryptCTRNand.py -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem>
@@ -778,7 +820,7 @@ def main():
     if args.nand is None or args.boot9 is None or args.otp is None:
         sys.exit("[!] -NandFile / -Boot9File / -OtpFile are required (see --help)")
 
-    print("=== decrypt3dsnand 2.0 ===")
+    print(f"=== decrypt3dsnand {VERSION} ===")
     print(f"NAND: {args.nand}")
     print(f"boot9: {args.boot9}")
     print(f"OTP: {args.otp}")

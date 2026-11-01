@@ -1,7 +1,7 @@
 /*
  * DecryptCTRNandGUI - 3DS NAND Dump Decryptor (Pure JDK 11, zero external deps)
  *
- * 2.0 - Java implementation kept byte-for-byte compatible with
+ * 2.1.1 - Java implementation kept byte-for-byte compatible with
  *        DecryptCTRNand.ps1 / DecryptCTRNand.py (see tests/).
  *
  * Pure JDK only: javax.swing + javax.crypto + java.util.BigInteger.
@@ -11,12 +11,19 @@
  *          -OtpFile otp.mem -CidFile nand_cid.mem -Mode dev -OutDir out -Force
  *     (a leading --cli is also accepted; legacy --nand-style aliases too)
  *
- * GUI (2.0):
+ * GUI (2.0+):
  *   - Tabbed multi-task: each tab is an independent decryption task; tasks run
  *     concurrently (per-task log routing + cancellation, ThreadLocal-based).
  *   - Drag & drop: path fields accept dropped files/folders from the OS.
  *   - i18n interface (Lang): built-in zh-CN (default) + en only; third-party
  *     languages can be registered via Lang.register(code, entries).
+ *
+ * 2.1.1 (concurrency / commit safety):
+ *   - Unique per-run .tmp names; publishing without -Force refuses to clobber
+ *     a file that appeared meanwhile (commitTmp); the TWL path always cleans up
+ *     its .tmp in a finally block.
+ *   - Two running GUI tasks may no longer share one output directory.
+ *   - A cancelled task reports "cancelled" instead of "error".
  *
  * Build (JDK >= 11; target 11 bytecode):
  *     javac --release 11 -d out/classes DecryptCTRNandGUI.java
@@ -53,6 +60,7 @@ import java.util.concurrent.ExecutionException;
 public class DecryptCTRNandGUI {
 
     // ---------------- constants ----------------
+    static final String VERSION = "2.1.1";
     static final byte[] OTP_MAGIC = hex("0FB0ADDE");
     static final BigInteger C1 = new BigInteger("1FF9E9AAC5FE0408024591DC5D52768A", 16);
     static final BigInteger MASK_128 = BigInteger.ONE.shiftLeft(128).subtract(BigInteger.ONE);
@@ -92,6 +100,45 @@ public class DecryptCTRNandGUI {
 
     static byte[] sub(byte[] src, int off, int len) {
         return Arrays.copyOfRange(src, off, off + len);
+    }
+
+    /** Normalized directory key used to detect two tasks sharing one output dir. */
+    static String normDir(String dir) {
+        if (dir == null || dir.trim().isEmpty()) return "";
+        try {
+            return Paths.get(dir.trim()).toAbsolutePath().normalize().toString()
+                    .toLowerCase(Locale.ROOT);
+        } catch (Exception e) {
+            return dir.trim().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    /** Unique per-run temp-file token: two tasks may target the same directory. */
+    static String uuid() {
+        return java.util.UUID.randomUUID().toString().replace("-", "");
+    }
+
+    /**
+     * Publish a fully verified temp file as the final output. Without force this
+     * is a no-clobber move (Files.move without REPLACE_EXISTING throws if the
+     * target exists), so a file created by a concurrent task is never silently
+     * replaced; force keeps the old atomic-replace semantics.
+     */
+    static void commitTmp(Path tmp, Path out, boolean force) throws IOException {
+        if (force) {
+            try {
+                Files.move(tmp, out, StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return;
+        }
+        try {
+            Files.move(tmp, out);
+        } catch (java.nio.file.FileAlreadyExistsException e) {
+            throw new IOException("Output already exists: " + out
+                    + ". Re-run with --force to overwrite.", e);
+        }
     }
 
     // ---------------- crypto ----------------
@@ -286,16 +333,30 @@ public class DecryptCTRNandGUI {
                                     java.util.concurrent.atomic.AtomicBoolean cancelled) throws Exception {
         String name = String.format("partition_%d_slot03.bin", p.index);
         Path outFile = outDir.resolve(name);
-        Path tmpFile = outDir.resolve(name + ".tmp");
+        Path tmpFile = outDir.resolve(name + "." + uuid() + ".tmp");
+        Files.deleteIfExists(tmpFile);
+        try {
+            decryptTwlPartitionInto(nand, p, twlKey, twlNonce, outFile, tmpFile,
+                    force, cancelable, cancelled);
+        } finally {
+            // A .tmp file must never survive a failure or a cancellation.
+            try {
+                Files.deleteIfExists(tmpFile);
+            } catch (IOException ignored) {
+            }
+        }
+    }
 
+    static void decryptTwlPartitionInto(Path nand, Partition p, byte[] twlKey, byte[] twlNonce,
+                                        Path outFile, Path tmpFile, boolean force, boolean cancelable,
+                                        java.util.concurrent.atomic.AtomicBoolean cancelled) throws Exception {
         if (Files.exists(outFile)) {
             if (!force) {
                 throw new IOException("Output already exists: " + outFile + ". Re-run with --force to overwrite.");
             }
             // -Force: the old file is NOT deleted here. It is replaced at commit
-            // time only after the new file passed every check (see the move below).
+            // time only after the new file passed every check (see commitTmp).
         }
-        Files.deleteIfExists(tmpFile);
 
         log("    Partition " + p.index + " (slot 0x03, TWL)...");
 
@@ -394,7 +455,7 @@ public class DecryptCTRNandGUI {
         boolean mbrSigOk = (mbr[0x40] & 0xFF) == 0x55 && (mbr[0x41] & 0xFF) == 0xAA;
         boolean blk1dOk = java.util.Arrays.equals(sub(mbr, 0x12, 16), TWL_BLK1D_ANCHOR);
 
-        boolean fatChecked = p.size > TWL_FAT_START + 0x200;
+        boolean fatChecked = p.size >= TWL_FAT_START + 0x200;
         boolean fatSigOk = true;
         String oem = "<skipped>";
         if (fatChecked) {
@@ -410,16 +471,14 @@ public class DecryptCTRNandGUI {
         }
 
         String checkNote;
+        // The caller's finally block removes the .tmp file on every failure path.
         if (!mbrSigOk) {
-            Files.deleteIfExists(tmpFile);
             throw new IOException("Partition " + p.index + ": TWL MBR 55AA missing (wrong key/OTP?)");
         }
         if (!blk1dOk) {
-            Files.deleteIfExists(tmpFile);
             throw new IOException("Partition " + p.index + ": TWL block 0x1D anchor mismatch (wrong key/OTP?)");
         }
         if (!fatSigOk) {
-            Files.deleteIfExists(tmpFile);
             throw new IOException("Partition " + p.index + ": twln FAT boot 55AA missing or OEM != 'TWL     ' (wrong offset?)");
         }
         checkNote = fatChecked
@@ -429,21 +488,13 @@ public class DecryptCTRNandGUI {
         if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
         String sha = fileSha256(tmpFile, cancelable, cancelled);
         if (cancelable && cancelled.get()) throw new IOException("Cancelled by user."); // final check before commit
-        try {
-            Files.move(tmpFile, outFile, StandardCopyOption.ATOMIC_MOVE);
-        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
-            Files.move(tmpFile, outFile, StandardCopyOption.REPLACE_EXISTING);
-        }
+        commitTmp(tmpFile, outFile, force);
         log(String.format("        saved (%s, wrote %d bytes, %s)",
                 p.size / 1048576.0 == Math.floor(p.size / 1048576.0)
                         ? (p.size / 1048576) + " MB"
                         : String.format("%.1f MB", p.size / 1048576.0),
                 written, checkNote));
         log("        SHA-256: " + sha);
-        try {
-            Files.deleteIfExists(tmpFile);
-        } catch (IOException ignored) {
-        }
     }
 
     // ---------------- OTP ----------------
@@ -719,7 +770,7 @@ public class DecryptCTRNandGUI {
                                  java.util.concurrent.atomic.AtomicBoolean cancelled) throws IOException {
         String name = String.format("partition_%d_slot%02X.bin", p.index, p.slot);
         Path outFile = outDir.resolve(name);
-        Path tmpFile = outDir.resolve(name + ".tmp");
+        Path tmpFile = outDir.resolve(name + "." + uuid() + ".tmp");
 
         if (Files.exists(outFile)) {
             if (!force) {
@@ -791,18 +842,13 @@ public class DecryptCTRNandGUI {
             }
 
             if (!checkOk) {
-                Files.deleteIfExists(tmpFile);
                 throw new IOException("Partition " + p.index + ": structural check failed - " + checkNote);
             }
 
             if (cancelable && cancelled.get()) throw new IOException("Cancelled by user.");
             String sha = fileSha256(tmpFile, cancelable, cancelled);
             if (cancelable && cancelled.get()) throw new IOException("Cancelled by user."); // final check before commit
-            try {
-                Files.move(tmpFile, outFile, StandardCopyOption.ATOMIC_MOVE);
-            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
-                Files.move(tmpFile, outFile, StandardCopyOption.REPLACE_EXISTING);
-            }
+            commitTmp(tmpFile, outFile, force);
 
             log(String.format("        saved (%s, wrote %d bytes, %s)",
                     p.size / 1048576.0 == Math.floor(p.size / 1048576.0)
@@ -881,7 +927,7 @@ public class DecryptCTRNandGUI {
         long nandLen = Files.size(nandPath);
         if (nandLen < 0x200) throw new RuntimeException("NAND: file too small to contain an NCSD header (< 0x200 bytes)");
 
-        log("=== DecryptCTRNand 2.0 (Java) ===");
+        log("=== DecryptCTRNand " + VERSION + " (Java) ===");
         log("NAND: " + o.nand);
         log("boot9: " + o.boot9);
         log("OTP: " + o.otp);
@@ -977,7 +1023,7 @@ public class DecryptCTRNandGUI {
 
     // ---------------- CLI ----------------
     static void printCliHelp() {
-        System.out.println("DecryptCTRNand 2.0 (Java) - 3DS NAND Dump Decryptor CLI");
+        System.out.println("DecryptCTRNand " + VERSION + " (Java) - 3DS NAND Dump Decryptor CLI");
         System.out.println();
         System.out.println("Usage:");
         System.out.println("  java -jar DecryptCTRNandGUI.jar -NandFile <sysnand.bin> -Boot9File <boot9.bin> -OtpFile <otp.mem>");
@@ -1135,11 +1181,12 @@ public class DecryptCTRNandGUI {
 
         static {
             java.util.Map<String, String> zh = new java.util.HashMap<>();
-            zh.put("title", "DecryptCTRNand 2.0 - 3DS NAND 解密工具（纯 JDK 11）");
+            zh.put("title", "DecryptCTRNand " + VERSION + " - 3DS NAND 解密工具（纯 JDK 11）");
             zh.put("newTask", "＋ 新建任务");
             zh.put("batch", "批量解密");
             zh.put("batchStart", "批量解密：已启动 %d 个任务");
             zh.put("batchNone", "批量解密：没有可启动的任务（均未配置或已在运行）");
+            zh.put("outdirBusy", "输出目录正被另一个运行中的任务使用：%s（请改用其他目录）");
             zh.put("closeTab", "×");
             zh.put("language", "语言:");
             zh.put("nand", "NAND dump:");
@@ -1166,11 +1213,12 @@ public class DecryptCTRNandGUI {
             register("zh-CN", zh);
 
             java.util.Map<String, String> en = new java.util.HashMap<>();
-            en.put("title", "DecryptCTRNand 2.0 - 3DS NAND Decryptor (Pure JDK 11)");
+            en.put("title", "DecryptCTRNand " + VERSION + " - 3DS NAND Decryptor (Pure JDK 11)");
             en.put("newTask", "+ New Task");
             en.put("batch", "Batch Decrypt");
             en.put("batchStart", "Batch decryption: started %d task(s)");
             en.put("batchNone", "Batch: nothing to start (unconfigured or already running)");
+            en.put("outdirBusy", "Output directory is in use by another running task: %s (choose another)");
             en.put("closeTab", "×");
             en.put("language", "Language:");
             en.put("nand", "NAND dump:");
@@ -1281,8 +1329,7 @@ public class DecryptCTRNandGUI {
                 TaskPanel p = (TaskPanel) tabs.getComponentAt(i);
                 if (p.running) continue;                       // already in flight
                 if (p.nandField.getText().trim().isEmpty()) continue; // unconfigured tab
-                p.startDecrypt();
-                started++;
+                if (p.startDecrypt()) started++;               // false: dir conflict
             }
             TaskPanel active = (TaskPanel) tabs.getSelectedComponent();
             active.appendLog(started > 0
@@ -1290,7 +1337,21 @@ public class DecryptCTRNandGUI {
                     : Lang.t("batchNone"));
         }
 
-        void closeTab(int idx) {            if (idx < 0 || idx >= tabs.getTabCount()) return;
+        /** A running task must not share its output directory with another task. */
+        boolean outputDirAvailable(TaskPanel self, String outdir) {
+            String dir = normDir(outdir);
+            if (dir.isEmpty()) return true; // no OutDir: no file is written
+            for (int i = 0; i < tabs.getTabCount(); i++) {
+                TaskPanel p = (TaskPanel) tabs.getComponentAt(i);
+                if (p != self && p.running && dir.equals(normDir(p.outdirField.getText().trim()))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        void closeTab(int idx) {
+            if (idx < 0 || idx >= tabs.getTabCount()) return;
             TaskPanel p = (TaskPanel) tabs.getComponentAt(idx);
             if (p.task != null && !p.task.isDone()) {
                 p.cancelled.set(true); // cancel in-flight work, then close the tab
@@ -1450,8 +1511,10 @@ public class DecryptCTRNandGUI {
             c.fill = GridBagConstraints.NONE;
         }
 
-        void startDecrypt() {
-            if (running) return; // guard: no double start (also used by batch)
+        /** @return true when the task was actually started (false: already running
+         *  or another task holds the same output directory). */
+        boolean startDecrypt() {
+            if (running) return false; // guard: no double start (also used by batch)
             Options o = new Options();
             o.nand = nandField.getText().trim();
             o.boot9 = boot9Field.getText().trim();
@@ -1464,6 +1527,11 @@ public class DecryptCTRNandGUI {
             o.force = forceBox.isSelected();
             o.showKeys = showKeysBox.isSelected();
 
+            if (!owner.outputDirAvailable(this, o.outdir)) {
+                appendLog(String.format(Lang.t("outdirBusy"), o.outdir));
+                return false;
+            }
+
             logArea.setText("");
             cancelled.set(false);
             running = true;
@@ -1474,6 +1542,7 @@ public class DecryptCTRNandGUI {
 
             task = new DecryptTask(o);
             task.execute();
+            return true;
         }
 
         void appendLog(String line) {
@@ -1545,6 +1614,10 @@ public class DecryptCTRNandGUI {
                 } catch (InterruptedException e) {
                     appendLog(Lang.t("cancelTitle"));
                 } catch (ExecutionException e) {
+                    if (cancelled.get()) {          // cooperative cancel, not a failure
+                        appendLog(Lang.t("cancelTitle"));
+                        return;
+                    }
                     Throwable t = e.getCause() != null ? e.getCause() : e;
                     appendLog(Lang.t("errorTitle"));
                     appendLog(t.getMessage() != null ? t.getMessage() : t.toString());
