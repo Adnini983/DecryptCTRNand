@@ -7,7 +7,7 @@
 
 ## 版本历史
 
-- **2.1.1（当前源码，未发布）**：并发输出安全与提交语义加固（三端同构）：临时文件改为随机唯一命名（`<out>.<guid>.tmp`）；未 `-Force` 时提交阶段**不覆盖**已存在的输出（PS1 `File::Move` 失败即报错、Python `os.link` + `os.unlink`、Java 不带 `REPLACE_EXISTING` 的 `Files.move`）；PS1 非原子回退改用唯一 `.bak` 名，不再删除用户已有的 `<out>.bak`；TWL twln FAT boot 检查边界 `>` → `>=`（恰好 `0x13000` 字节的分区不再被跳过）；Java TWL 路径补 `finally` 清理 `.tmp`；GUI 拒绝两个运行中任务共用同一输出目录，取消后显示「已取消」而非「错误」；三端 banner / GUI 标题 / CLI 帮助统一为 2.1.1。明细见「2.1.1 变更」。
+- **2.1.1（已发布，tag `2.1.1` = `45fa1ff`）**：并发输出安全与提交语义加固（三端同构）：临时文件改为随机唯一命名（`<out>.<guid>.tmp`）；未 `-Force` 时提交阶段**不覆盖**已存在的输出（PS1 `File::Move` 失败即报错、Python `os.link` + `os.unlink`、Java 不带 `REPLACE_EXISTING` 的 `Files.move`）；PS1 非原子回退改用唯一 `.bak` 名，不再删除用户已有的 `<out>.bak`；TWL twln FAT boot 检查边界 `>` → `>=`（恰好 `0x13000` 字节的分区不再被跳过）；Java TWL 路径补 `finally` 清理 `.tmp`；GUI 拒绝两个运行中任务共用同一输出目录，取消后显示「已取消」而非「错误」；三端 banner / GUI 标题 / CLI 帮助统一为 2.1.1。明细见「2.1.1 变更」。
 - **2.1.0（已发布，tag `2.1.0` = `149a64d`）**：第二轮审计修复（P0/P1/P2/P3），明细见「2.1.0 审计修复（第二轮）」。**注意**：2.1.0 的源码 banner 仍打印 2.0，且 README 当时未同步——这正是 2.1.1 统一版本号的起因。
 - **2.0（tag `2.0.0` = `7f18716`，发布资产为修复前版本）**：新增 **TWL 分区解密**（NCSD crypttype 1 → slot 0x03，SHA1(CID) 反转 nonce + TWL keyscrambler + 块内字节反转 CTR；**dev 开发机必须使用 raw OTP（otp.mem/.bin），otp_dec 无法解出正确的 TWL 密钥**——已在真机 dump 实证）。版本号由 1.0 修正为 2.0（此前外部审计误把 1.0 读成 0.1）。**修复：零售 TWL keyX 中间 8 字节 "NINTENDO" 的 LE 打包常量错误**（真机零售 OTP 暴露，dev 分支不受影响）。
 - **1.0（v0.2 加固版）**：依据外部代码审计系统性加固正确性/输入验证/输出验证/安全，并新增纯 JDK 11 GUI 实现与合成测试向量三端交叉验证。

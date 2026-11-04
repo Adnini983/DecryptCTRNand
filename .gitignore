@@ -15,3 +15,6 @@ tests/vec_log.txt
 
 # AI-agent onboarding doc (local only, not committed)
 AGENTS.md
+
+# long-term agent memory (single source of truth for AI handover; local only)
+AGENT_MEMORY.md
